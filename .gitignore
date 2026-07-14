@@ -1,0 +1,41 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+/test-results
+/playwright-report
+/blob-report
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+.env*.local
+.vercel
+*.tsbuildinfo
+next-env.d.ts
+
+# local run reports
+/data/
+
+# Bundled Apache JMeter (npm run jmeter:install)
+/tools/apache-jmeter-*/
+/tools/*.tgz
+
+# Appium drivers (installed via npm run appium:drivers)
+/.appium/
+jmeter.log
