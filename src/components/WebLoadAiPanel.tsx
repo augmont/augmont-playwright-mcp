@@ -382,7 +382,8 @@ export function WebLoadAiPanel({ baseUrl, apiUrl, onSaved }: Props) {
                           {c.load.method} {c.load.targetUrl}
                           {c.load.useApiBase ? ' (API)' : ''} · {c.load.virtualUsers} VUs ·{' '}
                           {c.load.durationSec}s · err ≤ {c.load.maxErrorRatePct}% · p95 ≤{' '}
-                          {c.load.p95Ms}ms
+                          {c.load.p95Ms}ms · p99 ≤{' '}
+                          {c.load.p99Ms ?? Math.round(c.load.p95Ms * 1.5)}ms
                         </span>
                         <br />
                         <span className="field-hint">{c.description}</span>

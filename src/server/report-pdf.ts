@@ -4,6 +4,7 @@ import PDFDocument from 'pdfkit';
 import type { ReportAiSummary, RunReport, TestStep } from '@/lib/types';
 import { ensureReportFlowChart } from '@/lib/flow-chart';
 import { resolveExpectation } from '@/lib/test-expectation';
+import { listConfiguredThresholdRows } from '@/lib/load-grade-summary';
 
 type PdfDoc = InstanceType<typeof PDFDocument>;
 
@@ -448,7 +449,12 @@ function writeStepRow(
   step: TestStep,
   opts?: { emphasize?: boolean; includeScreenshot?: boolean },
 ) {
-  const wantShot = opts?.emphasize || step.status === 'failed' || opts?.includeScreenshot;
+  const wantShot =
+    opts?.includeScreenshot === false
+      ? false
+      : Boolean(
+          opts?.emphasize || step.status === 'failed' || opts?.includeScreenshot,
+        );
   const hasShot =
     Boolean(step.screenshotPath) &&
     wantShot &&
@@ -576,9 +582,80 @@ function writeFooters(doc: PdfDoc, report: RunReport) {
   }
 }
 
+function writeLoadGrade(doc: PdfDoc, report: RunReport) {
+  const g = report.loadGradeSummary;
+  if (!g) return;
+
+  const limSource = {
+    maxErrorRatePct: g.thresholds.maxErrorRatePct,
+    p50Ms: g.thresholds.p50Ms,
+    p75Ms: g.thresholds.p75Ms,
+    p90Ms: g.thresholds.p90Ms,
+    p95Ms: g.thresholds.p95Ms,
+    p99Ms: g.thresholds.p99Ms,
+    avgMs: g.thresholds.avgMs,
+    maxAvgLatencyMs: g.thresholds.avgLatencyMs,
+    maxAvgConnectMs: g.thresholds.avgConnectMs,
+    virtualUsers: g.thresholds.virtualUsers,
+    durationSec: g.thresholds.durationSec,
+  };
+
+  const x = left(doc);
+  const w = innerW(doc);
+
+  sectionHeading(doc, `Performance grade · ${g.label}`);
+  ensureSpace(doc, 70);
+  doc.fillColor(C.text).fontSize(11).text(`${g.label}  (score ${g.score}/100)`, x, doc.y, {
+    width: w,
+  });
+  doc.moveDown(0.25);
+  doc.fillColor(C.muted).fontSize(9).text(g.summary, { width: w });
+  doc.moveDown(0.2);
+  doc.fillColor(C.muted).fontSize(9).text(`Why it matters: ${g.importance}`, { width: w });
+  doc.moveDown(0.4);
+
+  sectionHeading(doc, 'Current thresholds');
+  for (const row of listConfiguredThresholdRows(limSource)) {
+    ensureSpace(doc, 22);
+    doc
+      .fillColor(C.text)
+      .fontSize(9)
+      .text(`${row.label}`, x, doc.y, { continued: true, width: w * 0.45 });
+    doc
+      .fillColor(C.muted)
+      .fontSize(9)
+      .text(`  ${row.limit}  ·  ${row.category}`, { width: w * 0.55 });
+    doc.moveDown(0.12);
+  }
+  doc.moveDown(0.3);
+
+  sectionHeading(doc, 'Thresholds · required vs this run');
+  for (const row of g.metrics) {
+    ensureSpace(doc, 28);
+    const mark = row.passed ? 'PASS' : 'FAIL';
+    doc
+      .fillColor(row.passed ? C.pass : C.fail)
+      .fontSize(8.5)
+      .text(mark, x, doc.y, { continued: true, width: 36 });
+    doc
+      .fillColor(C.text)
+      .fontSize(9)
+      .text(
+        `  ${row.label}  ·  required ${row.required}  ·  actual ${row.actual}  ·  ${row.importance}`,
+        {
+          width: w - 40,
+        },
+      );
+    doc.moveDown(0.15);
+  }
+  doc.moveDown(0.25);
+}
+
 function writeLoadMetrics(doc: PdfDoc, report: RunReport) {
   const m = report.loadMetrics;
   if (!m) return;
+
+  writeLoadGrade(doc, report);
 
   sectionHeading(doc, 'JMeter load metrics');
   const x = left(doc);
@@ -643,6 +720,84 @@ function writeLoadMetrics(doc: PdfDoc, report: RunReport) {
     doc.fillColor(C.muted).fontSize(7.5).text(arts, { width: w });
     doc.moveDown(0.4);
   }
+
+  if (m.recentErrors?.length) {
+    sectionHeading(doc, 'Recent errors (request / response)');
+    const errors = m.recentErrors.slice(-15);
+    for (const e of errors) {
+      ensureSpace(doc, 48);
+      const title = [
+        e.method,
+        e.label,
+        e.status ? `HTTP ${e.status}` : null,
+      ]
+        .filter(Boolean)
+        .join(' · ');
+      doc.fillColor(C.fail).fontSize(9).text(title, { width: w });
+      if (e.url) {
+        doc.fillColor(C.muted).fontSize(7.5).text(e.url, { width: w });
+      }
+      doc.fillColor(C.text).fontSize(8).text(e.message, { width: w });
+      doc.moveDown(0.35);
+    }
+  }
+}
+
+function writeLoadAuth(doc: PdfDoc, report: RunReport) {
+  const a = report.loadAuth;
+  if (!a) return;
+
+  sectionHeading(doc, 'Authorization & Swagger');
+  const x = left(doc);
+  const w = innerW(doc);
+  const rows: [string, string][] = [
+    ['Auth required', a.requiresAuth ? 'Yes' : 'No'],
+    [
+      'Tokens obtained',
+      a.tokenObtained
+        ? `Yes · ${a.tokenCount}`
+        : a.requiresAuth
+          ? 'No'
+          : 'N/A',
+    ],
+  ];
+  if (a.credentialLabels?.length) {
+    rows.push(['Credentials used', a.credentialLabels.join(', ')]);
+  }
+  if (a.loginPath) rows.push(['Login path', a.loginPath]);
+  if (a.authHeaderName) rows.push(['Auth header', a.authHeaderName]);
+  if (a.swaggerUrl) rows.push(['Swagger URL', a.swaggerUrl]);
+  if (a.apiOnly) {
+    rows.push(['Engine', 'JMeter only (no MCP browser / screenshots)']);
+  }
+  if (a.selectedOperations?.length) {
+    rows.push([
+      'APIs tested',
+      a.selectedOperations.map((o) => `${o.method} ${o.path}`).join(' · '),
+    ]);
+  }
+  if (a.error) rows.push(['Auth error', a.error]);
+  rows.push(['Note', 'Passwords and raw tokens are never stored in reports']);
+
+  const rowH = 14;
+  const boxH = rows.length * rowH + 16;
+  ensureSpace(doc, boxH + 24);
+  const top = doc.y;
+  doc.save();
+  doc.roundedRect(x, top, w, boxH, 8).fillAndStroke(C.panel, C.line);
+  doc.restore();
+
+  let y = top + 8;
+  for (const [label, value] of rows) {
+    doc.fillColor(C.muted).fontSize(8).text(label, x + 12, y, { width: 140, lineBreak: false });
+    doc
+      .fillColor(label === 'Auth error' ? C.fail : C.text)
+      .fontSize(9)
+      .text(value, x + 155, y, { width: w - 170, lineBreak: false });
+    y += rowH;
+  }
+  doc.x = x;
+  doc.y = top + boxH + 10;
 }
 
 function writeVaptFindings(doc: PdfDoc, report: RunReport) {
@@ -794,12 +949,18 @@ function writeReportBody(doc: PdfDoc, report: RunReport) {
   const failedSteps = steps.filter((s) => s.status === 'failed');
   const isFail = report.status === 'failed' || failedSteps.length > 0;
   const ai = report.aiSummary;
-  const isLoad = Boolean(report.loadMetrics);
+  const isLoad = Boolean(report.loadMetrics || report.loadAuth);
   const isVapt = Boolean(report.vaptFindings);
+  /** Swagger/API load: no MCP browser screenshots in the PDF. */
+  const isApiLoad =
+    Boolean(report.loadAuth?.apiOnly) ||
+    Boolean(report.loadAuth?.swaggerUrl) ||
+    (isLoad && !steps.some((s) => s.id === 'load-mcp'));
 
   writeHeader(doc, report, isFail);
   writeStats(doc, counts);
   writeVaptFindings(doc, report);
+  writeLoadAuth(doc, report);
   writeLoadMetrics(doc, report);
   writeFlowChart(doc, report);
 
@@ -812,9 +973,15 @@ function writeReportBody(doc: PdfDoc, report: RunReport) {
   writeSummaryCard(doc, report, isFail);
 
   if (isFail && failedSteps.length) {
-    sectionHeading(doc, 'Failed steps (with screenshots)');
+    sectionHeading(
+      doc,
+      isApiLoad ? 'Failed steps' : 'Failed steps (with screenshots)',
+    );
     for (const step of failedSteps) {
-      writeStepRow(doc, step, { emphasize: true, includeScreenshot: true });
+      writeStepRow(doc, step, {
+        emphasize: true,
+        includeScreenshot: !isApiLoad,
+      });
     }
   }
 
@@ -843,7 +1010,13 @@ function writeReportBody(doc: PdfDoc, report: RunReport) {
 
   sectionHeading(
     doc,
-    isVapt ? 'VAPT steps & screenshots' : isLoad ? 'Load steps & screenshots' : 'Full step log',
+    isVapt
+      ? 'VAPT steps & screenshots'
+      : isLoad
+        ? isApiLoad
+          ? 'Load steps'
+          : 'Load steps & screenshots'
+        : 'Full step log',
   );
   if (!steps.length) {
     doc.fillColor(C.muted).fontSize(9).text('No steps stored for this report.');
@@ -851,7 +1024,9 @@ function writeReportBody(doc: PdfDoc, report: RunReport) {
     for (const step of steps) {
       writeStepRow(doc, step, {
         emphasize: step.status === 'failed',
-        includeScreenshot: isVapt || isLoad || Boolean(step.screenshotPath),
+        includeScreenshot:
+          !isApiLoad &&
+          (isVapt || isLoad || Boolean(step.screenshotPath)),
       });
     }
   }

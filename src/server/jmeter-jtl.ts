@@ -35,6 +35,16 @@ function stddev(values: number[], mean: number): number {
 
 type TimedSample = { ts: number; elapsed: number };
 
+export type JtlErrorSample = {
+  at?: string;
+  label: string;
+  method?: string;
+  url?: string;
+  status?: string;
+  message: string;
+  success: boolean;
+};
+
 export type JtlAgg = {
   latencies: number[];
   /** Time-to-first-byte samples (Latency column) */
@@ -52,6 +62,8 @@ export type JtlAgg = {
   latestThreads: number;
   firstTs: number;
   lastTs: number;
+  /** Cap recent failures for UI / reports */
+  recentErrors: JtlErrorSample[];
 };
 
 function emptyAgg(): JtlAgg {
@@ -69,6 +81,7 @@ function emptyAgg(): JtlAgg {
     latestThreads: 0,
     firstTs: 0,
     lastTs: 0,
+    recentErrors: [],
   };
 }
 
@@ -145,6 +158,41 @@ function ingestRow(agg: JtlAgg, header: string[], cols: string[]) {
   if (Number.isFinite(ts) && ts > 0) {
     if (!agg.firstTs || ts < agg.firstTs) agg.firstTs = ts;
     if (ts > agg.lastTs) agg.lastTs = ts;
+  }
+  if (!success) {
+    const label = map.label || map.samplerlabel || 'request';
+    const failure =
+      map.failuremessage ||
+      map.responsemessage ||
+      map.message ||
+      `HTTP ${code}`;
+    const responseBody = (
+      map.responsedata ||
+      map['response data'] ||
+      map.responsebody ||
+      ''
+    ).trim();
+    const methodGuess =
+      map.method ||
+      map.httpmethod ||
+      (label.match(/^(GET|POST|PUT|PATCH|DELETE|HEAD)\b/i)?.[1]?.toUpperCase() ??
+        undefined);
+    const parts = [String(failure)];
+    if (responseBody) {
+      parts.push(`Response: ${responseBody.replace(/\s+/g, ' ').slice(0, 400)}`);
+    }
+    agg.recentErrors.push({
+      at: Number.isFinite(ts) && ts > 0 ? new Date(ts).toISOString() : undefined,
+      label,
+      method: methodGuess,
+      url: map.url || undefined,
+      status: code,
+      message: parts.join(' · ').slice(0, 800),
+      success: false,
+    });
+    if (agg.recentErrors.length > 40) {
+      agg.recentErrors = agg.recentErrors.slice(-40);
+    }
   }
   pruneRecent(agg);
 }
@@ -247,6 +295,7 @@ export function jtlToMetrics(
       : undefined,
     jmeterThreads: peakThreads,
     latestThreads,
+    recentErrors: agg.recentErrors.length ? [...agg.recentErrors] : undefined,
   };
 }
 

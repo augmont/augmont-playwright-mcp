@@ -4,8 +4,10 @@ import { useEffect } from 'react';
 import type { RunReport, TestStep } from '@/lib/types';
 import { ModalCloseButton } from '@/components/ModalCloseButton';
 import { ReportFlowChart } from '@/components/ReportFlowChart';
+import { LoadThresholdsPanel } from '@/components/LoadThresholdsPanel';
 import { resolveExpectation } from '@/lib/test-expectation';
 import { ensureReportFlowChart } from '@/lib/flow-chart';
+import { buildLoadGradeSummary } from '@/lib/load-grade-summary';
 
 function formatWhen(iso?: string) {
   if (!iso) return '—';
@@ -407,7 +409,99 @@ export function ReportDetailModal({
             </div>
           ) : null}
 
+          {report.loadAuth ? (
+            <div className="load-panel" style={{ margin: '1rem 0 1.5rem' }}>
+              <h3 className="section-title" style={{ marginTop: 0 }}>
+                Authorization &amp; Swagger
+              </h3>
+              <dl className="load-detail-dl">
+                <div>
+                  <dt>Auth required</dt>
+                  <dd>{report.loadAuth.requiresAuth ? 'Yes' : 'No'}</dd>
+                </div>
+                <div>
+                  <dt>Tokens obtained</dt>
+                  <dd>
+                    {report.loadAuth.tokenObtained
+                      ? `Yes · ${report.loadAuth.tokenCount}`
+                      : report.loadAuth.requiresAuth
+                        ? 'No'
+                        : 'N/A'}
+                  </dd>
+                </div>
+                {report.loadAuth.credentialLabels?.length ? (
+                  <div>
+                    <dt>Credentials used</dt>
+                    <dd>{report.loadAuth.credentialLabels.join(', ')}</dd>
+                  </div>
+                ) : null}
+                {report.loadAuth.loginPath ? (
+                  <div>
+                    <dt>Login path</dt>
+                    <dd>
+                      <code>{report.loadAuth.loginPath}</code>
+                    </dd>
+                  </div>
+                ) : null}
+                {report.loadAuth.swaggerUrl ? (
+                  <div>
+                    <dt>Swagger URL</dt>
+                    <dd>
+                      <code>{report.loadAuth.swaggerUrl}</code>
+                    </dd>
+                  </div>
+                ) : null}
+                {report.loadAuth.selectedOperations?.length ? (
+                  <div>
+                    <dt>APIs tested</dt>
+                    <dd>
+                      {report.loadAuth.selectedOperations.map((op, i) => (
+                        <span key={`${op.method}-${op.path}-${i}`}>
+                          {i > 0 ? ' · ' : ''}
+                          <code>
+                            {op.method} {op.path}
+                          </code>
+                        </span>
+                      ))}
+                    </dd>
+                  </div>
+                ) : null}
+                {report.loadAuth.error ? (
+                  <div>
+                    <dt>Auth error</dt>
+                    <dd className="api-error-inline">{report.loadAuth.error}</dd>
+                  </div>
+                ) : null}
+              </dl>
+              <p className="history-meta">
+                Passwords and raw tokens are never stored in reports.
+              </p>
+            </div>
+          ) : null}
+
           {report.loadMetrics ? (
+            <>
+              <LoadThresholdsPanel
+                grade={
+                  report.loadGradeSummary ||
+                  buildLoadGradeSummary({
+                    metrics: report.loadMetrics,
+                    thresholds: {
+                      maxErrorRatePct: 10,
+                      p95Ms: 4000,
+                      p99Ms: 6000,
+                      p50Ms: 1800,
+                      p75Ms: 2600,
+                      p90Ms: 3400,
+                      avgMs: 2200,
+                      virtualUsers: report.loadMetrics.virtualUsers,
+                      durationSec: report.loadMetrics.elapsedSec,
+                    },
+                    status: report.status,
+                    error: report.error,
+                  })
+                }
+              />
             <div className="load-panel" style={{ margin: '1rem 0 1.5rem' }}>
               <h3 className="section-title" style={{ marginTop: 0 }}>
                 JMeter load metrics
@@ -483,7 +577,34 @@ export function ReportDetailModal({
                   </div>
                 ) : null}
               </div>
+              {report.loadMetrics.recentErrors?.length ? (
+                <div className="load-error-list">
+                  <div className="load-metrics-section-label">
+                    Recent errors (request / response)
+                  </div>
+                  <ul className="load-error-ul">
+                    {report.loadMetrics.recentErrors.slice(-20).map((e, i) => (
+                      <li key={`${e.label}-${i}`}>
+                        <strong>
+                          {e.method ? `${e.method} ` : ''}
+                          {e.label}
+                        </strong>
+                        {e.status ? ` · HTTP ${e.status}` : ''}
+                        {e.url ? (
+                          <>
+                            <br />
+                            <code>{e.url}</code>
+                          </>
+                        ) : null}
+                        <br />
+                        <span className="api-error-inline">{e.message}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
             </div>
+            </>
           ) : null}
 
           <ReportFlowChart

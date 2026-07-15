@@ -3,6 +3,8 @@ import path from 'path';
 import type { RunReport, RunSnapshot, TestStep } from '@/lib/types';
 import { buildReportFlowChart } from '@/lib/flow-chart';
 import { enrichReportWithAiSummary, buildLocalReportAiSummary } from '@/server/report-ai-summary';
+import { buildLoadGradeSummary, defaultLoadP99Ms } from '@/lib/load-grade-summary';
+import { getWebLoadCase } from '@/server/web-load-store';
 import { generateReportPdf, reportPdfAbsolutePath } from '@/server/report-pdf';
 
 const MAX_REPORTS = 20;
@@ -70,6 +72,23 @@ export function snapshotToReport(snapshot: RunSnapshot): RunReport {
       ? finished - started
       : undefined;
 
+  let loadGradeSummary = snapshot.loadGradeSummary;
+  if (!loadGradeSummary && snapshot.loadMetrics) {
+    const loadCase = getWebLoadCase(snapshot.testId);
+    loadGradeSummary = buildLoadGradeSummary({
+      metrics: snapshot.loadMetrics,
+      thresholds: loadCase?.load || {
+        maxErrorRatePct: 10,
+        p95Ms: 4000,
+        p99Ms: defaultLoadP99Ms(4000),
+        virtualUsers: snapshot.loadMetrics.virtualUsers,
+        durationSec: snapshot.loadMetrics.elapsedSec,
+      },
+      status: snapshot.status,
+      error: snapshot.error,
+    });
+  }
+
   return {
     runId: snapshot.runId,
     testId: snapshot.testId,
@@ -102,6 +121,8 @@ export function snapshotToReport(snapshot: RunSnapshot): RunReport {
     },
     error: snapshot.error,
     loadMetrics: snapshot.loadMetrics,
+    loadAuth: snapshot.loadAuth,
+    loadGradeSummary,
     vaptFindings: snapshot.vaptFindings,
   };
 }

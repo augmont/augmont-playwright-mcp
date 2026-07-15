@@ -6,6 +6,17 @@ import { useRouter } from 'next/navigation';
 import { McpLiveView } from '@/components/McpLiveView';
 import { isWebLoadReady, useAppStore } from '@/lib/store';
 import { useStoreHydrated } from '@/lib/use-store-hydrated';
+import {
+  countLoadAuthCredentials,
+  loadAuthCredentialsForRun,
+  readLoadAuthLoginConfig,
+  readPresetAuthHeaders,
+} from '@/lib/load-auth-credentials';
+import { LoadAuthCredentialsModal } from '@/components/LoadAuthCredentialsModal';
+import { SwaggerSuiteEditModal } from '@/components/SwaggerSuiteEditModal';
+import { LoadGradeSummaryPanel } from '@/components/LoadGradeSummaryPanel';
+import { LoadThresholdsPanel } from '@/components/LoadThresholdsPanel';
+import { buildLoadGradeSummary } from '@/lib/load-grade-summary';
 import type {
   RunReport,
   RunSnapshot,
@@ -14,7 +25,7 @@ import type {
   WebLoadTestCase,
 } from '@/lib/types';
 
-type PageView = 'live' | 'report';
+type PageView = 'live' | 'report' | 'thresholds';
 
 function formatWhen(iso?: string) {
   if (!iso) return '—';
@@ -54,11 +65,19 @@ function MetricCell({ label, value }: { label: string; value: string | number })
   );
 }
 
-function MetricsPanel({ metrics }: { metrics?: WebLoadLiveMetrics | null }) {
+function MetricsPanel({
+  metrics,
+  apiOnly,
+}: {
+  metrics?: WebLoadLiveMetrics | null;
+  apiOnly?: boolean;
+}) {
   if (!metrics) {
     return (
       <div className="load-metrics-empty">
-        Start the load test — JMeter CLI drives traffic while MCP shows the live page.
+        {apiOnly
+          ? 'Start the load test — JMeter CLI drives API traffic (no browser needed).'
+          : 'Start the load test — JMeter CLI drives traffic while MCP shows the live page.'}
       </div>
     );
   }
@@ -154,6 +173,31 @@ function MetricsPanel({ metrics }: { metrics?: WebLoadLiveMetrics | null }) {
           )}
         </div>
       </div>
+
+      {metrics.recentErrors?.length ? (
+        <div className="load-error-list">
+          <div className="load-metrics-section-label">Recent errors (request / response)</div>
+          <ul className="load-error-ul">
+            {metrics.recentErrors.slice(-12).map((e, i) => (
+              <li key={`${e.label}-${i}`}>
+                <strong>
+                  {e.method ? `${e.method} ` : ''}
+                  {e.label}
+                </strong>
+                {e.status ? ` · HTTP ${e.status}` : ''}
+                {e.url ? (
+                  <>
+                    <br />
+                    <code>{e.url}</code>
+                  </>
+                ) : null}
+                <br />
+                <span className="api-error-inline">{e.message}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -162,15 +206,19 @@ function StepList({
   steps,
   runId,
   showShots,
+  apiOnly,
 }: {
   steps: TestStep[];
   runId?: string | null;
   showShots?: boolean;
+  apiOnly?: boolean;
 }) {
   if (!steps.length) {
     return (
       <p className="hero-sub" style={{ margin: 0 }}>
-        Prepare JMeter → MCP live view → JMeter CLI → Thresholds
+        {apiOnly
+          ? 'Authorize → Prepare JMeter → JMeter CLI → Thresholds'
+          : 'Prepare JMeter → MCP live view → JMeter CLI → Thresholds'}
       </p>
     );
   }
@@ -225,8 +273,12 @@ export function LoadTestWorkspace({
   const [starting, setStarting] = useState(false);
   const [pdfBusy, setPdfBusy] = useState(false);
   const [error, setError] = useState('');
+  const [credsOpen, setCredsOpen] = useState(false);
+  const [credCount, setCredCount] = useState(0);
+  const [editOpen, setEditOpen] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
   const logEndRef = useRef<HTMLDivElement | null>(null);
+  const autostartDoneRef = useRef(false);
 
   const ready = isWebLoadReady({ testMode, baseUrl });
   const active =
@@ -303,24 +355,29 @@ export function LoadTestWorkspace({
     };
   }, []);
 
-  // Fetch persisted report when run finishes (for PDF + enriched summary)
+  // Fetch persisted report when run finishes (for PDF + AI-enriched summary)
   useEffect(() => {
     if (!runId || !finished) return;
     let cancelled = false;
     let tries = 0;
+    const maxTries = 45; // ~45s — OpenRouter enrich can land after local-template
     const poll = () => {
       tries += 1;
       fetch(`/api/reports/${encodeURIComponent(runId)}`)
         .then((r) => (r.ok ? r.json() : null))
         .then((data) => {
-          if (cancelled || !data?.report) {
-            if (!cancelled && tries < 12) setTimeout(poll, 800);
+          if (cancelled) return;
+          if (!data?.report) {
+            if (tries < maxTries) setTimeout(poll, 1000);
             return;
           }
           setReport(data.report as RunReport);
+          const model = (data.report as RunReport).aiSummary?.model;
+          const awaitingAi = !model || model === 'local-template';
+          if (awaitingAi && tries < maxTries) setTimeout(poll, 1000);
         })
         .catch(() => {
-          if (!cancelled && tries < 12) setTimeout(poll, 800);
+          if (!cancelled && tries < maxTries) setTimeout(poll, 1000);
         });
     };
     poll();
@@ -334,20 +391,70 @@ export function LoadTestWorkspace({
     logEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
   }, [logLines.length]);
 
-  async function startRun() {
+  useEffect(() => {
+    setCredCount(countLoadAuthCredentials());
+  }, [loadCase, credsOpen]);
+
+  useEffect(() => {
+    if (!hydrated || !ready || !loadCase) return;
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('autostart') !== '1') return;
+    if (autostartDoneRef.current) return;
+    autostartDoneRef.current = true;
+    router.replace(`/tests/${encodeURIComponent(testId)}`, { scroll: false });
+    void startRun(loadCase);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one-shot autostart after case load
+  }, [hydrated, ready, loadCase, testId, router]);
+
+  async function startRun(caseOverride?: WebLoadTestCase) {
+    const current = caseOverride ?? loadCase;
     setStarting(true);
     setError('');
     setSnapshot(null);
     setReport(null);
     setView('live');
     try {
+      const requiresAuth = Boolean(current?.load.requiresAuth);
+      const creds = loadAuthCredentialsForRun();
+      const login = readLoadAuthLoginConfig();
+      const presetHeaders = readPresetAuthHeaders();
+
+      if (requiresAuth && !creds.length && !presetHeaders.length) {
+        setCredsOpen(true);
+        throw new Error(
+          'This API requires authorization. Add username/password or a Bearer token, then run again.',
+        );
+      }
+
       const res = await fetch(`/api/tests/${encodeURIComponent(testId)}/run`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           mode: 'web-load',
           baseUrl,
-          apiUrl: apiUrl || undefined,
+          apiUrl: current?.load.apiBaseUrl || apiUrl || undefined,
+          loadAuthCredentials: creds.length ? creds : undefined,
+          loadAuthLogin: login?.loginPath ? login : undefined,
+          authHeaderValues: presetHeaders.length ? presetHeaders : undefined,
+          authHeaderName: login?.tokenHeader || 'Authorization',
+          loadAuthMeta: {
+            swaggerUrl: current?.load.swaggerUrl,
+            loginPath: login?.loginPath,
+            credentialLabels: creds.length
+              ? creds.map((c) => c.label)
+              : presetHeaders.length
+                ? ['preset-token']
+                : [],
+            selectedOperations: [
+              {
+                method: current?.load.method || 'GET',
+                path: current?.load.targetUrl || '',
+                summary: current?.name,
+                requiresAuth,
+              },
+            ],
+          },
         }),
       });
       const data = await res.json();
@@ -422,12 +529,49 @@ export function LoadTestWorkspace({
     (snapshot?.startedAt && snapshot?.finishedAt
       ? Date.parse(snapshot.finishedAt) - Date.parse(snapshot.startedAt)
       : undefined);
+  const apiOnly = Boolean(
+    loadCase?.load.swaggerUrl ||
+      loadCase?.load.useApiBase ||
+      report?.loadAuth?.apiOnly ||
+      snapshot?.loadAuth?.apiOnly,
+  );
+  /** Grade/badge only after the run finishes — live partial JTL must not show Fail/Poor. */
+  const runFinished =
+    status === 'completed' || status === 'failed' || status === 'stopped';
+  const gradeSummary =
+    report?.loadGradeSummary ||
+    (runFinished ? snapshot?.loadGradeSummary : undefined) ||
+    (runFinished && metrics && loadCase
+      ? buildLoadGradeSummary({
+          metrics,
+          thresholds: loadCase.load,
+          status: status || 'completed',
+          error: report?.error || snapshot?.error,
+        })
+      : null);
+  const aiSummary = report?.aiSummary;
+  const thresholdsBadge = active ? (
+    <span className="load-grade-badge load-grade-pending" title="Grade is set when JMeter finishes">
+      Running
+    </span>
+  ) : gradeSummary ? (
+    <span
+      className={`load-grade-badge load-grade-${gradeSummary.grade}`}
+      title={`Score ${gradeSummary.score}/100`}
+    >
+      {gradeSummary.label}
+    </span>
+  ) : null;
 
   return (
     <main className="page load-run-page load-run-fullscreen">
       <div className="load-run-header">
         <div className="load-run-header-copy">
-          <p className="choice-card-eyebrow">Web load test · JMeter CLI + MCP</p>
+          <p className="choice-card-eyebrow">
+            {apiOnly
+              ? 'Swagger API load · JMeter CLI'
+              : 'Web load test · JMeter CLI + MCP'}
+          </p>
           <h1 className="hero-title load-run-title">{title}</h1>
           <p className="hero-sub load-run-sub">
             {loadCase ? (
@@ -447,6 +591,26 @@ export function LoadTestWorkspace({
           <Link href="/tests/load" className="load-back-link">
             ← All load tests
           </Link>
+          {loadCase ? (
+            <button
+              type="button"
+              className="btn btn-ghost"
+              disabled={active}
+              onClick={() => setEditOpen(true)}
+            >
+              Edit case
+            </button>
+          ) : null}
+          {loadCase?.load.requiresAuth || credCount > 0 ? (
+            <button
+              type="button"
+              className={`btn btn-ghost ${credCount ? 'has-creds' : ''}`}
+              onClick={() => setCredsOpen(true)}
+              disabled={active}
+            >
+              {credCount ? `Auth credentials (${credCount})` : 'Set auth credentials'}
+            </button>
+          ) : null}
           {finished ? (
             <button
               type="button"
@@ -474,6 +638,13 @@ export function LoadTestWorkspace({
         </div>
       </div>
 
+      {loadCase?.load.requiresAuth ? (
+        <p className="step-msg load-auth-hint">
+          🔒 This API requires authorization. Add one or more username/password pairs — tokens
+          are obtained at run start and attached to JMeter (never saved in reports).
+        </p>
+      ) : null}
+
       {error ? <p className="error-text">{error}</p> : null}
 
       <div className="load-view-tabs" role="tablist" aria-label="Load run views">
@@ -485,6 +656,16 @@ export function LoadTestWorkspace({
           onClick={() => setView('live')}
         >
           Live run
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={view === 'thresholds'}
+          className={`load-view-tab ${view === 'thresholds' ? 'active' : ''}`}
+          onClick={() => setView('thresholds')}
+        >
+          Thresholds
+          {thresholdsBadge}
         </button>
         <button
           type="button"
@@ -502,7 +683,9 @@ export function LoadTestWorkspace({
       </div>
 
       {view === 'live' ? (
-        <div className="load-run-layout">
+        <div
+          className={`load-run-layout ${apiOnly ? 'load-run-layout-api' : ''}`}
+        >
           <div className="load-run-main">
             <section className="load-panel">
               <h2 className="load-panel-title">
@@ -513,7 +696,7 @@ export function LoadTestWorkspace({
                   </span>
                 ) : null}
               </h2>
-              <MetricsPanel metrics={metrics} />
+              <MetricsPanel metrics={metrics} apiOnly={apiOnly} />
               {metrics?.jtlPath || metrics?.jmxPath ? (
                 <p className="load-artifact-paths">
                   {metrics.jmxPath ? (
@@ -539,7 +722,7 @@ export function LoadTestWorkspace({
 
             <section className="load-panel">
               <h2 className="load-panel-title">Steps</h2>
-              <StepList steps={steps} />
+              <StepList steps={steps} apiOnly={apiOnly} />
             </section>
 
             <section className="load-panel">
@@ -560,15 +743,17 @@ export function LoadTestWorkspace({
           </div>
 
           <aside className="load-run-side">
-            <section className="load-panel load-mcp-panel">
-              <h2 className="load-panel-title">MCP live browser</h2>
-              <McpLiveView
-                runId={runId}
-                active={Boolean(runId && active)}
-                title="Portal under load"
-                idleHint="Start the test to open the target page in Playwright while JMeter hits it with virtual users."
-              />
-            </section>
+            {!apiOnly ? (
+              <section className="load-panel load-mcp-panel">
+                <h2 className="load-panel-title">MCP live browser</h2>
+                <McpLiveView
+                  runId={runId}
+                  active={Boolean(runId && active)}
+                  title="Portal under load"
+                  idleHint="Start the test to open the target page in Playwright while JMeter hits it with virtual users."
+                />
+              </section>
+            ) : null}
 
             {loadCase ? (
               <section className="load-panel">
@@ -598,7 +783,11 @@ export function LoadTestWorkspace({
                   <div>
                     <dt>Thresholds</dt>
                     <dd>
-                      err ≤ {loadCase.load.maxErrorRatePct}% · p95 ≤ {loadCase.load.p95Ms}ms
+                      err ≤ {loadCase.load.maxErrorRatePct}% · p50/p75/p90/p95/p99/avg
+                      checked separately
+                      {loadCase.load.p95Ms
+                        ? ` (p95 ≤ ${loadCase.load.p95Ms}ms)`
+                        : ''}
                     </dd>
                   </div>
                   <div>
@@ -615,17 +804,56 @@ export function LoadTestWorkspace({
                       </dd>
                     </div>
                   ) : null}
+                  {loadCase.load.requiresAuth ? (
+                    <div>
+                      <dt>Authorization</dt>
+                      <dd>Required · {credCount || 0} credential(s) saved</dd>
+                    </div>
+                  ) : null}
+                  {loadCase.load.swaggerUrl ? (
+                    <div>
+                      <dt>Swagger</dt>
+                      <dd>
+                        <code>{loadCase.load.swaggerUrl}</code>
+                      </dd>
+                    </div>
+                  ) : null}
                 </dl>
               </section>
             ) : null}
           </aside>
+        </div>
+      ) : view === 'thresholds' ? (
+        <div className="load-report-view">
+          <LoadThresholdsPanel
+            thresholds={loadCase?.load || null}
+            grade={runFinished ? gradeSummary : null}
+          />
+          {active ? (
+            <section className="load-panel">
+              <p className="history-meta" style={{ margin: 0 }}>
+                JMeter is still running — threshold Pass/Fail and the grade badge
+                appear only after the run completes. Live metrics stay on the Live
+                run tab.
+              </p>
+            </section>
+          ) : !gradeSummary && loadCase ? (
+            <section className="load-panel">
+              <p className="history-meta" style={{ margin: 0 }}>
+                Threshold limits above come from this case&apos;s Load settings.
+                After a completed JMeter run, this tab also shows required vs
+                actual for every metric.
+              </p>
+            </section>
+          ) : null}
         </div>
       ) : (
         <div className="load-report-view">
           {!runId ? (
             <section className="load-panel load-report-empty">
               <p className="hero-sub" style={{ margin: 0 }}>
-                Run a load test to generate the report (metrics, steps, screenshots, PDF).
+                Run a load test to generate the report (metrics, steps
+                {apiOnly ? '' : ', screenshots'}, PDF).
               </p>
             </section>
           ) : (
@@ -638,58 +866,138 @@ export function LoadTestWorkspace({
                       {status ? (
                         <span className={`load-status load-status-${status}`}>{status}</span>
                       ) : null}
+                      {runFinished && gradeSummary ? (
+                        <span
+                          className={`load-grade-badge load-grade-${gradeSummary.grade}`}
+                          style={{ marginLeft: '0.45rem' }}
+                        >
+                          {gradeSummary.label}
+                        </span>
+                      ) : active ? (
+                        <span
+                          className="load-grade-badge load-grade-pending"
+                          style={{ marginLeft: '0.45rem' }}
+                        >
+                          Running
+                        </span>
+                      ) : null}
                     </h2>
                     <p className="load-report-meta">
                       {formatWhen(report?.finishedAt || snapshot?.finishedAt || snapshot?.startedAt)}
-                      {' · '}
-                      Duration {formatDuration(durationMs)}
-                      {' · '}
-                      Run {runId.slice(0, 8)}
+                      {durationMs != null ? ` · ${formatDuration(durationMs)}` : ''}
+                      {runId ? (
+                        <>
+                          {' · '}
+                          <code>{runId.slice(0, 8)}</code>
+                        </>
+                      ) : null}
                     </p>
-                    {report?.guidance || report?.aiSummary?.narrative ? (
-                      <p className="load-report-summary">
-                        {report.aiSummary?.headline
-                          ? `${report.aiSummary.headline} — `
-                          : null}
-                        {report.aiSummary?.narrative || report.guidance}
-                      </p>
-                    ) : (
-                      <p className="load-report-summary">
-                        JMeter CLI results with MCP browser screenshots for{' '}
-                        <strong>{title}</strong>.
-                      </p>
-                    )}
                   </div>
-                  <button
-                    type="button"
-                    className="btn btn-primary"
-                    disabled={pdfBusy}
-                    onClick={() => void downloadPdf()}
-                  >
-                    {pdfBusy ? 'Preparing PDF…' : 'Download PDF report'}
-                  </button>
                 </div>
               </section>
 
+              {(runFinished && (gradeSummary || aiSummary)) ? (
+                <LoadGradeSummaryPanel
+                  grade={gradeSummary}
+                  aiSummary={aiSummary}
+                  thresholds={loadCase?.load || null}
+                  showThresholdTables
+                />
+              ) : loadCase ? (
+                <LoadThresholdsPanel
+                  thresholds={loadCase.load}
+                  grade={null}
+                />
+              ) : null}
+
+              {(() => {
+                const auth = report?.loadAuth || snapshot?.loadAuth;
+                if (!auth) return null;
+                return (
+                  <section className="load-panel">
+                    <h2 className="load-panel-title">Authorization &amp; Swagger</h2>
+                    <dl className="load-detail-dl">
+                      <div>
+                        <dt>Auth required</dt>
+                        <dd>{auth.requiresAuth ? 'Yes' : 'No'}</dd>
+                      </div>
+                      <div>
+                        <dt>Tokens obtained</dt>
+                        <dd>
+                          {auth.tokenObtained
+                            ? `Yes · ${auth.tokenCount}`
+                            : auth.requiresAuth
+                              ? 'No'
+                              : 'N/A'}
+                        </dd>
+                      </div>
+                      {auth.credentialLabels?.length ? (
+                        <div>
+                          <dt>Credentials used</dt>
+                          <dd>{auth.credentialLabels.join(', ')}</dd>
+                        </div>
+                      ) : null}
+                      {auth.loginPath ? (
+                        <div>
+                          <dt>Login path</dt>
+                          <dd>
+                            <code>{auth.loginPath}</code>
+                          </dd>
+                        </div>
+                      ) : null}
+                      {auth.authHeaderName ? (
+                        <div>
+                          <dt>Auth header</dt>
+                          <dd>
+                            <code>{auth.authHeaderName}</code>
+                          </dd>
+                        </div>
+                      ) : null}
+                      {auth.swaggerUrl ? (
+                        <div>
+                          <dt>Swagger URL</dt>
+                          <dd>
+                            <code>{auth.swaggerUrl}</code>
+                          </dd>
+                        </div>
+                      ) : null}
+                      {auth.selectedOperations?.length ? (
+                        <div>
+                          <dt>APIs tested</dt>
+                          <dd>
+                            {auth.selectedOperations.map((op, i) => (
+                              <span key={`${op.method}-${op.path}-${i}`}>
+                                {i > 0 ? ' · ' : ''}
+                                <code>
+                                  {op.method} {op.path}
+                                </code>
+                              </span>
+                            ))}
+                          </dd>
+                        </div>
+                      ) : null}
+                      {auth.error ? (
+                        <div>
+                          <dt>Auth error</dt>
+                          <dd className="api-error-inline">{auth.error}</dd>
+                        </div>
+                      ) : null}
+                    </dl>
+                    <p className="history-meta" style={{ marginTop: '0.75rem' }}>
+                      Passwords and raw tokens are never stored in reports — only labels and status.
+                    </p>
+                  </section>
+                );
+              })()}
+
               <div className="load-report-grid">
                 <section className="load-panel">
-                  <h2 className="load-panel-title">Performance metrics</h2>
-                  <MetricsPanel metrics={metrics} />
-                  {metrics?.jtlPath || metrics?.jmxPath ? (
-                    <p className="load-artifact-paths">
-                      {metrics.jmxPath ? (
-                        <>
-                          JMX: <code>{metrics.jmxPath}</code>
-                        </>
-                      ) : null}
-                      {metrics.jmxPath && metrics.jtlPath ? ' · ' : null}
-                      {metrics.jtlPath ? (
-                        <>
-                          JTL: <code>{metrics.jtlPath}</code>
-                        </>
-                      ) : null}
-                    </p>
-                  ) : null}
+                  <h2 className="load-panel-title">Final metrics</h2>
+                  {metrics ? (
+                    <MetricsPanel metrics={metrics} apiOnly={apiOnly} />
+                  ) : (
+                    <p className="load-metrics-empty">Waiting for metrics…</p>
+                  )}
                 </section>
 
                 <section className="load-panel">
@@ -697,30 +1005,15 @@ export function LoadTestWorkspace({
                   {loadCase ? (
                     <dl className="load-detail-dl">
                       <div>
-                        <dt>Method</dt>
-                        <dd>{loadCase.load.method}</dd>
-                      </div>
-                      <div>
-                        <dt>Target</dt>
+                        <dt>Method / target</dt>
                         <dd>
-                          <code>{loadCase.load.targetUrl}</code>
+                          {loadCase.load.method} <code>{loadCase.load.targetUrl}</code>
                         </dd>
                       </div>
                       <div>
-                        <dt>Virtual users</dt>
-                        <dd>{loadCase.load.virtualUsers}</dd>
-                      </div>
-                      <div>
-                        <dt>Duration / ramp</dt>
+                        <dt>VUs · duration</dt>
                         <dd>
-                          {loadCase.load.durationSec}s / {loadCase.load.rampUpSec}s
-                        </dd>
-                      </div>
-                      <div>
-                        <dt>Thresholds</dt>
-                        <dd>
-                          err ≤ {loadCase.load.maxErrorRatePct}% · p95 ≤ {loadCase.load.p95Ms}
-                          ms
+                          {loadCase.load.virtualUsers} · {loadCase.load.durationSec}s
                         </dd>
                       </div>
                       <div>
@@ -737,8 +1030,15 @@ export function LoadTestWorkspace({
               </div>
 
               <section className="load-panel">
-                <h2 className="load-panel-title">Steps & screenshots</h2>
-                <StepList steps={steps} runId={runId} showShots />
+                <h2 className="load-panel-title">
+                  {apiOnly ? 'Steps' : 'Steps & screenshots'}
+                </h2>
+                <StepList
+                  steps={steps}
+                  runId={runId}
+                  showShots={!apiOnly}
+                  apiOnly={apiOnly}
+                />
               </section>
 
               {(snapshot?.error || report?.error) && (
@@ -763,6 +1063,32 @@ export function LoadTestWorkspace({
           )}
         </div>
       )}
+
+      <LoadAuthCredentialsModal
+        open={credsOpen}
+        onClose={() => {
+          setCredsOpen(false);
+          setCredCount(countLoadAuthCredentials());
+        }}
+        onSaved={() => setCredCount(countLoadAuthCredentials())}
+      />
+
+      <SwaggerSuiteEditModal
+        open={editOpen}
+        loadCase={loadCase}
+        onClose={() => setEditOpen(false)}
+        onSaved={(updated) => {
+          setLoadCase(updated);
+          setEditOpen(false);
+          setCredCount(countLoadAuthCredentials());
+        }}
+        onRunLoadTest={async (updated) => {
+          setLoadCase(updated);
+          setEditOpen(false);
+          setCredCount(countLoadAuthCredentials());
+          await startRun(updated);
+        }}
+      />
 
       {view === 'live' && snapshot?.error ? (
         <p className="error-text">Run error: {snapshot.error}</p>

@@ -71,6 +71,37 @@ export async function POST(
       admin?: { email?: string; password?: string };
       seller?: { email?: string; password?: string };
     };
+    /** Multi-user load auth credentials (username/password) */
+    loadAuthCredentials?: Array<{
+      id?: string;
+      label?: string;
+      username?: string;
+      password?: string;
+    }>;
+    loadAuthLogin?: {
+      loginPath?: string;
+      method?: string;
+      usernameField?: string;
+      passwordField?: string;
+      extraBody?: Record<string, string>;
+      tokenJsonPath?: string;
+      tokenHeader?: string;
+      tokenPrefix?: string;
+    };
+    /** Pre-obtained Authorization header values (e.g. "Bearer …") */
+    authHeaderValues?: string[];
+    authHeaderName?: string;
+    loadAuthMeta?: {
+      swaggerUrl?: string;
+      loginPath?: string;
+      credentialLabels?: string[];
+      selectedOperations?: Array<{
+        method: string;
+        path: string;
+        summary?: string;
+        requiresAuth?: boolean;
+      }>;
+    };
     platform?: 'android' | 'ios';
     osVersion?: string;
     deviceVersion?: string;
@@ -191,6 +222,55 @@ export async function POST(
       );
     }
 
+    const loadAuthCredentials = Array.isArray(body.loadAuthCredentials)
+      ? body.loadAuthCredentials
+          .map((c, i) => ({
+            id: String(c?.id || `cred-${i + 1}`),
+            label: String(c?.label || `User ${i + 1}`).trim() || `User ${i + 1}`,
+            username: String(c?.username || '').trim(),
+            password: String(c?.password || ''),
+          }))
+          .filter((c) => c.username && c.password)
+      : undefined;
+
+    const loginRaw = body.loadAuthLogin;
+    const authLogin =
+      loginRaw?.loginPath?.trim()
+        ? {
+            loginPath: loginRaw.loginPath.trim(),
+            method: (loginRaw.method as 'POST' | 'GET' | undefined) || 'POST',
+            usernameField: loginRaw.usernameField,
+            passwordField: loginRaw.passwordField,
+            extraBody: loginRaw.extraBody,
+            tokenJsonPath: loginRaw.tokenJsonPath,
+            tokenHeader: loginRaw.tokenHeader,
+            tokenPrefix: loginRaw.tokenPrefix,
+          }
+        : undefined;
+
+    const authHeaderValues = Array.isArray(body.authHeaderValues)
+      ? body.authHeaderValues.map(String).filter((v) => v.trim())
+      : undefined;
+
+    const loadAuthMeta = body.loadAuthMeta
+      ? {
+          swaggerUrl: body.loadAuthMeta.swaggerUrl,
+          loginPath: body.loadAuthMeta.loginPath || authLogin?.loginPath,
+          credentialLabels:
+            body.loadAuthMeta.credentialLabels ||
+            loadAuthCredentials?.map((c) => c.label) ||
+            [],
+          selectedOperations: body.loadAuthMeta.selectedOperations || [],
+          requiresAuth: Boolean(
+            webLoad.load.requiresAuth ||
+              loadAuthCredentials?.length ||
+              authHeaderValues?.length,
+          ),
+          tokenObtained: false,
+          tokenCount: 0,
+        }
+      : undefined;
+
     const steps = createWebLoadSessionSteps(webLoad);
     const runId = uuidv4();
     const session = createSession({
@@ -201,8 +281,16 @@ export async function POST(
       baseUrl,
       apiUrl,
       steps,
+      loadAuth: loadAuthMeta,
     });
-    void runWebLoad(runId, baseUrl, webLoad, { apiUrl });
+    void runWebLoad(runId, baseUrl, webLoad, {
+      apiUrl,
+      authCredentials: loadAuthCredentials,
+      authLogin,
+      authHeaderValues,
+      authHeaderName: body.authHeaderName,
+      loadAuthMeta,
+    });
     return NextResponse.json({ runId, snapshot: toSnapshot(session) });
   }
 

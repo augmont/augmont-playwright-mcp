@@ -23,6 +23,7 @@
     "react-dom": "^19.1.0",
     "uuid": "^11.1.0",
     "webdriverio": "^9.29.1",
+    "xlsx": "^0.18.5",
     "zustand": "^5.0.5"
   },
   "devDependencies": {

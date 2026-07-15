@@ -63,6 +63,37 @@ Rules:
 - Include 1–3 hardening snippets (Express/Next middleware, nginx headers, curl re-check) — NOT active exploit payloads.
 - Do not invent secrets or credentials.`;
 
+const LOAD_SUMMARY_SYSTEM = `You are a senior performance engineer and SRE writing elaborate JMeter load-test study reports for Augmont LGD (Swagger/API + portal) suites.
+
+Return ONLY valid JSON (no markdown fences) matching:
+{
+  "headline": "Grade + short result, e.g. BEST · LOAD PASS — concise why",
+  "narrative": "6-10 sentences. Elaborate: what was tested, traffic shape (VUs/duration/RPS/samples), latency profile (p50/p75/p90/p95/p99/avg) vs each SLA, error/success story, headroom vs limits, release recommendation, and what to watch next (auth, TTFB, connect, hot endpoints). Do NOT paste the raw metric dump again as a single dense paragraph of required/actual pairs — interpret them in prose.",
+  "whyFailed": "required on FAIL/Poor: which SLAs broke, likely capacity vs app vs auth root cause",
+  "rootCause": "one-line technical cause (e.g. Strong headroom under SLA / p95 breach on login / auth token thrash)",
+  "developerActions": ["5-8 concrete engineering follow-ups: profiling, caching, DB, timeouts, connection pools, auth path, CI gates"],
+  "preventionActions": ["4-8 lasting controls: SLOs in monitoring, autoscale, rate limits, canaries, dashboards for p95/p99/error%"],
+  "testerActions": ["4-6 QA actions: re-run matrix, evidence in PDF/Report tab, compare grade across builds, soak/spike ideas"],
+  "studyNotes": "2-4 sentences teaching the team how to read Best/Good/Fair/Poor and why p50–p99 are checked separately",
+  "codeSnippets": [
+    {
+      "title": "short title",
+      "language": "bash" | "javascript" | "typescript" | "text",
+      "code": "useful retest (curl), k6/jmeter note, or CI threshold assert example",
+      "why": "why this helps keep the grade honest"
+    }
+  ]
+}
+
+Rules:
+- This is JMeter HTTP load (often API-only / no browser). Focus on latency SLAs, error rate, throughput, auth under load — not Playwright UI.
+- Always discuss grade Best|Good|Fair|Poor meaning for go-live confidence.
+- Call out headroom: e.g. p95 at 7% of limit is excellent; near 85% of limit is Fair risk.
+- On PASS: still elaborate — do not be terse. On FAIL: prioritize whyFailed + capacity diagnosis.
+- Include 2–4 snippets (curl smoke, threshold checklist text, or monitoring query hint). Keep each under 15 lines.
+- Never invent passwords/tokens. Never claim MCP browser was used for API-only runs.
+- Be specific to numbers in the payload (samples, RPS, percentiles, error%).`;
+
 function compactSteps(steps: TestStep[]) {
   return steps.slice(0, 40).map((s) => ({
     id: s.id,
@@ -360,6 +391,124 @@ export function buildLocalReportAiSummary(report: RunReport): ReportAiSummary {
   const isFail = report.status === 'failed' || failed.length > 0;
   const codeSnippets = buildLocalSnippets(report, failed);
   const vapt = report.vaptFindings;
+  const load = report.loadMetrics;
+  const grade = report.loadGradeSummary;
+
+  if (load) {
+    const g = grade;
+    const badge = g?.label || (isFail ? 'Poor' : 'Good');
+    const failedCrit = (g?.metrics || []).filter(
+      (r) => !r.passed && (r.importance === 'critical' || r.importance === 'high'),
+    );
+    const headroom = g
+      ? `Observed latency sat well inside SLAs (p95 ${load.p95Ms}ms vs ≤ ${g.thresholds.p95Ms}ms; p99 ${load.p99Ms}ms vs ≤ ${g.thresholds.p99Ms}ms; avg ${load.avgMs}ms vs ≤ ${g.thresholds.avgMs}ms).`
+      : `p95 ${load.p95Ms}ms · p99 ${load.p99Ms}ms · avg ${load.avgMs}ms.`;
+    const traffic = `JMeter recorded ${load.totalRequests} samples at ~${load.rps} RPS with ${load.virtualUsers} planned VUs over ~${load.elapsedSec}s (engine ${load.engine || 'jmeter'}).`;
+    const errors = `Error rate ${load.errorRatePct}% with success ${load.successRatePct ?? 100 - load.errorRatePct}% (${load.successCount} ok / ${load.errorCount} errors).`;
+    const ops = report.loadAuth?.selectedOperations?.length
+      ? `APIs under test: ${report.loadAuth.selectedOperations
+          .slice(0, 8)
+          .map((o) => `${o.method} ${o.path}`)
+          .join(', ')}.`
+      : '';
+
+    return {
+      headline: `${badge.toUpperCase()} · LOAD ${isFail ? 'FAIL' : 'PASS'} — ${report.testName}`,
+      narrative: [
+        `${badge} grade for "${report.testName}" after a ${report.loadAuth?.apiOnly ? 'Swagger/API (JMeter-only) ' : ''}load run.`,
+        traffic,
+        errors,
+        isFail
+          ? `Critical or high SLAs were missed: ${failedCrit.map((r) => `${r.label} actual ${r.actual} (need ${r.required})`).join('; ') || report.error || 'see thresholds table'}.`
+          : `${headroom} Percentile ladder p50/p75/p90/p95/p99 = ${load.p50Ms}/${load.p75Ms ?? '—'}/${load.p90Ms ?? '—'}/${load.p95Ms}/${load.p99Ms} ms.`,
+        g?.importance ||
+          'Use the grade as a go-live signal: Best/Good support release confidence; Fair needs capacity work; Poor blocks a green go-live.',
+        ops,
+        'Read the Thresholds tab for every Required vs Actual row (error rate, p50–p99, avg, and TTFB/connect when present).',
+      ]
+        .filter(Boolean)
+        .join(' '),
+      whyFailed: isFail
+        ? report.error ||
+          failedCrit
+            .map((r) => `${r.label}: got ${r.actual}, need ${r.required}`)
+            .join(' · ') ||
+          'Load thresholds or traffic requirements were not met.'
+        : undefined,
+      rootCause: isFail
+        ? 'Load SLA / capacity or application latency under concurrency'
+        : g?.grade === 'best'
+          ? 'Strong headroom under all critical latency and error SLAs'
+          : 'Within required load thresholds with limited headroom',
+      developerActions: isFail
+        ? [
+            'Open recentErrors and statusCounts — identify which endpoints and HTTP statuses dominated failures.',
+            'Profile handlers that blew p95/p99; check DB queries, external calls, and JSON serialization under concurrency.',
+            'If 401/403 spike, harden token obtain/refresh for multi-VU auth CSV runs.',
+            'Tune connection pools / timeouts before raising virtual users.',
+            'Re-run the same VUs/duration after fixes and require grade Good or Best.',
+            'Add CI gates on error% and p95/p99 matching this case’s thresholds.',
+          ]
+        : [
+            'Archive this graded run as the release performance baseline for these APIs.',
+            'Wire monitoring alerts at ~70–80% of the p95/p99 and error% thresholds used here.',
+            'Keep auth login path and token JSON path stable across envs so load auth stays green.',
+            'If traffic is expected to grow, plan a soak (+duration) and a spike (+VUs) case next.',
+            'Document hot endpoints from this suite in the capacity review notes.',
+            'Track grade badge trend across builds (Best → Fair is an early regression signal).',
+          ],
+      preventionActions: [
+        'Publish API SLOs for error rate, p95, and p99 aligned to these thresholds.',
+        'Add canary or pre-prod JMeter (or equivalent) before production deploys.',
+        'Autoscale / rate-limit edges that protect origin under load spikes.',
+        'Dashboard p50–p99 and error% per critical route; alert before SLA breach.',
+        'Capacity review when grade drops from Best/Good to Fair on the same case.',
+      ],
+      testerActions: [
+        'Share Report → Performance summary + Thresholds tables as go-live evidence.',
+        'Download the PDF and attach badge, narrative, and required-vs-actual table to the release ticket.',
+        isFail
+          ? 'After the fix, re-run this exact load case until the badge is Good or Best.'
+          : 'Re-run after API, auth, or infra changes and compare the grade badge to this baseline.',
+        'For confidence, add a longer duration soak once Best/Good is stable on the short run.',
+        'Verify Authorization users/tokens still obtain cleanly under the same VU count.',
+      ],
+      studyNotes: [
+        `Badge ${badge} (score ${g?.score ?? 'n/a'}) is the product of separate critical checks — not a single averaged latency.`,
+        'p50 shows typical user experience; p95/p99 catch the slow tail that users feel as timeouts; avg alone can hide outliers.',
+        'Best means wide headroom; Good meets SLAs; Fair is tight; Poor failed at least one critical threshold or produced no traffic.',
+        report.loadAuth?.apiOnly
+          ? 'This was an API load (JMeter only) — no MCP browser proof was required.'
+          : 'Portal loads may also show MCP live view for visual context under traffic.',
+      ].join(' '),
+      codeSnippets: [
+        {
+          title: 'SLA checklist (this run)',
+          language: 'text',
+          code: (g?.metrics || [])
+            .filter((r) => r.importance === 'critical' || r.importance === 'high')
+            .map(
+              (r) =>
+                `${r.passed ? 'PASS' : 'FAIL'} ${r.label}\n  need ${r.required}\n  got  ${r.actual}`,
+            )
+            .join('\n\n') || 'No metric comparison available.',
+          why: 'Quick copy for the release ticket; full table lives on the Thresholds tab.',
+        },
+        {
+          title: 'Retest smoke (example curl)',
+          language: 'bash',
+          code: [
+            `# Smoke one target after load (adjust path + bearer)`,
+            `curl -sS -o /dev/null -w 'http=%{http_code} t=%{time_total}\\n' \\`,
+            `  -H 'Authorization: Bearer $TOKEN' \\`,
+            `  "$API_BASE${report.loadAuth?.selectedOperations?.[0]?.path || '/health'}"`,
+          ].join('\n'),
+          why: 'Confirms the hot path still answers cleanly after the graded load.',
+        },
+      ],
+      model: 'local-template',
+    };
+  }
 
   if (vapt) {
     const fails = (vapt.findings || []).filter((f) => f.status === 'fail' || f.status === 'error');
@@ -573,6 +722,8 @@ export async function enrichReportWithAiSummary(report: RunReport): Promise<RunR
 
   try {
     const failed = (report.steps || []).filter((s) => s.status === 'failed');
+    const isLoad = Boolean(report.loadMetrics);
+    const isVapt = Boolean(report.vaptFindings);
     const user = [
       `Test: ${report.testName} (${report.testId})`,
       report.testDescription ? `Description: ${report.testDescription}` : '',
@@ -583,8 +734,12 @@ export async function enrichReportWithAiSummary(report: RunReport): Promise<RunR
       `DurationMs: ${report.durationMs ?? 'n/a'}`,
       `Counts: ${JSON.stringify(report.stepCounts)}`,
       report.error ? `Primary error: ${report.error}` : '',
-      `Failed steps: ${JSON.stringify(compactSteps(failed))}`,
-      `All steps (compact): ${JSON.stringify(compactSteps(report.steps || []))}`,
+      !isLoad
+        ? `Failed steps: ${JSON.stringify(compactSteps(failed))}`
+        : '',
+      !isLoad
+        ? `All steps (compact): ${JSON.stringify(compactSteps(report.steps || []))}`
+        : `Load steps (compact): ${JSON.stringify(compactSteps(report.steps || []))}`,
       `API errors: ${JSON.stringify((report.apiErrors || []).slice(0, 8))}`,
       report.vaptFindings
         ? `VAPT findings: ${JSON.stringify({
@@ -597,20 +752,80 @@ export async function enrichReportWithAiSummary(report: RunReport): Promise<RunR
             networkSample: report.vaptFindings.networkCaptures?.slice(0, 8),
           })}`
         : '',
-      report.vaptFindings
+      report.loadMetrics
+        ? `Load metrics: ${JSON.stringify({
+            engine: report.loadMetrics.engine,
+            totalRequests: report.loadMetrics.totalRequests,
+            rps: report.loadMetrics.rps,
+            errorRatePct: report.loadMetrics.errorRatePct,
+            successRatePct: report.loadMetrics.successRatePct,
+            successCount: report.loadMetrics.successCount,
+            errorCount: report.loadMetrics.errorCount,
+            p50Ms: report.loadMetrics.p50Ms,
+            p75Ms: report.loadMetrics.p75Ms,
+            p90Ms: report.loadMetrics.p90Ms,
+            p95Ms: report.loadMetrics.p95Ms,
+            p99Ms: report.loadMetrics.p99Ms,
+            avgMs: report.loadMetrics.avgMs,
+            minMs: report.loadMetrics.minMs,
+            maxMs: report.loadMetrics.maxMs,
+            stddevMs: report.loadMetrics.stddevMs,
+            avgLatencyMs: report.loadMetrics.avgLatencyMs,
+            avgConnectMs: report.loadMetrics.avgConnectMs,
+            kbPerSec: report.loadMetrics.kbPerSec,
+            virtualUsers: report.loadMetrics.virtualUsers,
+            elapsedSec: report.loadMetrics.elapsedSec,
+            jmeterThreads: report.loadMetrics.jmeterThreads,
+            statusCounts: report.loadMetrics.statusCounts,
+            recentErrors: report.loadMetrics.recentErrors?.slice(-12),
+          })}`
+        : '',
+      report.loadGradeSummary
+        ? `Load grade summary: ${JSON.stringify({
+            grade: report.loadGradeSummary.grade,
+            label: report.loadGradeSummary.label,
+            score: report.loadGradeSummary.score,
+            summary: report.loadGradeSummary.summary,
+            importance: report.loadGradeSummary.importance,
+            thresholds: report.loadGradeSummary.thresholds,
+            metrics: report.loadGradeSummary.metrics,
+          })}`
+        : '',
+      report.loadAuth
+        ? `Load auth context: ${JSON.stringify({
+            apiOnly: report.loadAuth.apiOnly,
+            requiresAuth: report.loadAuth.requiresAuth,
+            tokenObtained: report.loadAuth.tokenObtained,
+            tokenCount: report.loadAuth.tokenCount,
+            loginPath: report.loadAuth.loginPath,
+            swaggerUrl: report.loadAuth.swaggerUrl,
+            selectedOperations: report.loadAuth.selectedOperations,
+          })}`
+        : '',
+      isVapt
         ? 'This is an API VAPT report. Emphasize: (1) why each attack finding matters, (2) immediate fixes in developerActions, (3) lasting how-to-prevent controls in preventionActions, (4) hardening code snippets, (5) retest guidance for QA.'
-        : 'Write an elaborate developer/tester study summary with code snippets.',
+        : isLoad
+          ? 'This is a JMeter load report. Write an ELABORATE performance narrative (6–10 sentences): interpret the grade, headroom vs each latency SLA, error story, release recommendation, and next watches. Fill preventionActions. Do not dump raw required/actual as one dense list — the Thresholds table already shows that.'
+          : 'Write an elaborate developer/tester study summary with code snippets.',
     ]
       .filter(Boolean)
       .join('\n');
 
+    const system = isVapt
+      ? VAPT_SUMMARY_SYSTEM
+      : isLoad
+        ? LOAD_SUMMARY_SYSTEM
+        : REPORT_SUMMARY_SYSTEM;
+
     const { text, model } = await callOpenRouterWithFallback({
-      system: report.vaptFindings ? VAPT_SUMMARY_SYSTEM : REPORT_SUMMARY_SYSTEM,
+      system,
       user,
       // Prefer coding-capable free models first (list order in openrouter-models)
       preferredModel: process.env.OPENROUTER_REPORT_MODEL || 'auto',
-      temperature: 0.25,
-      maxTokens: Number(process.env.OPENROUTER_REPORT_MAX_TOKENS || 2200),
+      temperature: isLoad ? 0.35 : 0.25,
+      maxTokens: Number(
+        process.env.OPENROUTER_REPORT_MAX_TOKENS || (isLoad ? 3200 : 2200),
+      ),
     });
 
     const parsed = extractJsonFromModelText(text);

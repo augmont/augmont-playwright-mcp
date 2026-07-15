@@ -1,11 +1,13 @@
 import type {
   ApiErrorRecord,
   CountryRunResult,
+  LoadGradeSummary,
   RunSnapshot,
   RunStatus,
   StepStatus,
   TestStep,
   WebFlowRole,
+  WebLoadAuthReport,
   WebLoadLiveMetrics,
   VaptLiveMetrics,
 } from '@/lib/types';
@@ -33,6 +35,8 @@ export interface LiveSession {
   finishedAt?: string;
   latestFrame?: Buffer;
   loadMetrics?: WebLoadLiveMetrics;
+  loadAuth?: WebLoadAuthReport;
+  loadGradeSummary?: LoadGradeSummary;
   vaptFindings?: VaptLiveMetrics;
   abortController: AbortController;
   listeners: Set<Listener>;
@@ -84,6 +88,8 @@ export function toSnapshot(session: LiveSession): RunSnapshot {
     countryResults: session.countryResults,
     apiErrors: session.apiErrors,
     loadMetrics: session.loadMetrics,
+    loadAuth: session.loadAuth,
+    loadGradeSummary: session.loadGradeSummary,
     vaptFindings: session.vaptFindings,
   };
 }
@@ -110,6 +116,7 @@ export function createSession(input: {
   baseUrl: string;
   apiUrl?: string;
   steps: TestStep[];
+  loadAuth?: WebLoadAuthReport;
 }): LiveSession {
   const session: LiveSession = {
     ...input,
@@ -189,6 +196,20 @@ export function updateLoadMetrics(runId: string, metrics: WebLoadLiveMetrics) {
   const session = sessions().get(runId);
   if (!session) return;
   session.loadMetrics = metrics;
+  emit(session);
+}
+
+export function updateLoadAuth(runId: string, loadAuth: WebLoadAuthReport) {
+  const session = sessions().get(runId);
+  if (!session) return;
+  session.loadAuth = loadAuth;
+  emit(session);
+}
+
+export function updateLoadGradeSummary(runId: string, summary: LoadGradeSummary) {
+  const session = sessions().get(runId);
+  if (!session) return;
+  session.loadGradeSummary = summary;
   emit(session);
 }
 

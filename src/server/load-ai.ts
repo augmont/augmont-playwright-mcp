@@ -47,6 +47,7 @@ Return ONLY valid JSON (no markdown fences) matching this schema:
         "rampUpSec": 5,
         "maxErrorRatePct": 5,
         "p95Ms": 2000,
+        "p99Ms": 3000,
         "useApiBase": false,
         "profile": "basic" | "advanced",
         "requests": [
@@ -75,7 +76,7 @@ Rules:
 - Prefer relative paths (not full host) so users can change baseUrl.
 - useApiBase=true only for Location API / backend API endpoints.
 - Keep light smoke loads by default: virtualUsers 5–20, durationSec 20–60, rampUpSec 3–10.
-- maxErrorRatePct typically 5–15; p95Ms typically 1500–4000.
+- maxErrorRatePct typically 5–15; p95Ms typically 1500–4000; p99Ms typically ~1.5× p95 (checked separately).
 - id must start with "load-" and be unique kebab-case.
 - Return 1–3 cases unless the user asks for more (max 5).
 - For advanced multi-step (customer browse, multiple login gates, API multi-call): set profile "advanced" and fill requests[] (2–6 steps) with thinkTimeMs 150–400.

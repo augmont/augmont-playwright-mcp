@@ -35,12 +35,22 @@ export type ResolvedLoadSampler = {
   method: WebLoadHttpMethod;
   headers?: Record<string, string>;
   body?: string;
+  /** When true, send as multipart form (JMeter DO_MULTIPART_POST) */
+  multipart?: boolean;
+  /** form-urlencoded / form-data pairs (preferred over raw body when set) */
+  formPairs?: Array<{ name: string; value: string }>;
   thinkTimeMs?: number;
+  /** @deprecated Prefer extractJsons */
   extractJson?: {
     varName: string;
     jsonPath: string;
     defaultValue?: string;
   };
+  extractJsons?: Array<{
+    varName: string;
+    jsonPath: string;
+    defaultValue?: string;
+  }>;
 };
 
 function headerManagerXml(headers: Record<string, string> | undefined): string {
@@ -66,9 +76,36 @@ function samplerXml(s: ResolvedLoadSampler): string {
   const { protocol, domain, port, path } = parseUrl(s.url);
   const method = s.method || 'GET';
   const body = s.body || '';
-  const hasBody = Boolean(body) && !['GET', 'HEAD'].includes(method);
-  const bodyXml = hasBody
-    ? `
+  const formPairs = s.formPairs || [];
+  const hasRawBody =
+    Boolean(body) &&
+    !['GET', 'HEAD'].includes(method) &&
+    !formPairs.length;
+  const hasFormBody =
+    formPairs.length > 0 && !['GET', 'HEAD'].includes(method);
+
+  let bodyXml: string;
+  if (hasFormBody) {
+    const args = formPairs
+      .map(
+        (p) => `
+            <elementProp name="${xmlEscape(p.name)}" elementType="HTTPArgument">
+              <boolProp name="HTTPArgument.always_encode">true</boolProp>
+              <stringProp name="Argument.name">${xmlEscape(p.name)}</stringProp>
+              <stringProp name="Argument.value">${xmlEscape(p.value)}</stringProp>
+              <stringProp name="Argument.metadata">=</stringProp>
+              <boolProp name="HTTPArgument.use_equals">true</boolProp>
+            </elementProp>`,
+      )
+      .join('');
+    bodyXml = `
+        <boolProp name="HTTPSampler.postBodyRaw">false</boolProp>
+        <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+          <collectionProp name="Arguments.arguments">${args}
+          </collectionProp>
+        </elementProp>`;
+  } else if (hasRawBody) {
+    bodyXml = `
         <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
         <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
           <collectionProp name="Arguments.arguments">
@@ -78,11 +115,13 @@ function samplerXml(s: ResolvedLoadSampler): string {
               <stringProp name="Argument.metadata">=</stringProp>
             </elementProp>
           </collectionProp>
-        </elementProp>`
-    : `
+        </elementProp>`;
+  } else {
+    bodyXml = `
         <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" enabled="true">
           <collectionProp name="Arguments.arguments"/>
         </elementProp>`;
+  }
 
   // ConstantTimer as sibling AFTER the sampler = think time before the next request
   const thinkAfter =
@@ -94,16 +133,24 @@ function samplerXml(s: ResolvedLoadSampler): string {
         <hashTree/>`
       : '';
 
-  const extract = s.extractJson
-    ? `
-          <JSONPostProcessor guiclass="JSONPostProcessorGui" testclass="JSONPostProcessor" testname="Extract ${xmlEscape(s.extractJson.varName)}" enabled="true">
-            <stringProp name="JSONPostProcessor.referenceNames">${xmlEscape(s.extractJson.varName)}</stringProp>
-            <stringProp name="JSONPostProcessor.jsonPathExprs">${xmlEscape(s.extractJson.jsonPath)}</stringProp>
+  const extracts =
+    s.extractJsons?.length
+      ? s.extractJsons
+      : s.extractJson
+        ? [s.extractJson]
+        : [];
+  const extract = extracts
+    .map(
+      (ex) => `
+          <JSONPostProcessor guiclass="JSONPostProcessorGui" testclass="JSONPostProcessor" testname="Extract ${xmlEscape(ex.varName)}" enabled="true">
+            <stringProp name="JSONPostProcessor.referenceNames">${xmlEscape(ex.varName)}</stringProp>
+            <stringProp name="JSONPostProcessor.jsonPathExprs">${xmlEscape(ex.jsonPath)}</stringProp>
             <stringProp name="JSONPostProcessor.match_numbers">1</stringProp>
-            <stringProp name="JSONPostProcessor.defaultValues">${xmlEscape(s.extractJson.defaultValue || 'NOT_FOUND')}</stringProp>
+            <stringProp name="JSONPostProcessor.defaultValues">${xmlEscape(ex.defaultValue || 'NOT_FOUND')}</stringProp>
           </JSONPostProcessor>
-          <hashTree/>`
-    : '';
+          <hashTree/>`,
+    )
+    .join('');
 
   return `
         <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="${xmlEscape(s.name)}" enabled="true">
@@ -115,7 +162,7 @@ function samplerXml(s: ResolvedLoadSampler): string {
           <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
           <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
           <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
-          <boolProp name="HTTPSampler.DO_MULTIPART_POST">false</boolProp>
+          <boolProp name="HTTPSampler.DO_MULTIPART_POST">${s.multipart ? 'true' : 'false'}</boolProp>
           <stringProp name="HTTPSampler.connect_timeout">10000</stringProp>
           <stringProp name="HTTPSampler.response_timeout">30000</stringProp>
           ${bodyXml}
@@ -135,10 +182,17 @@ export function buildHttpLoadJmx(opts: {
   load: WebLoadConfig;
   /** When provided, multi-request advanced plan; otherwise single primary target */
   samplers?: ResolvedLoadSampler[];
+  /**
+   * When set, writes CSVDataSet reading authToken from this filename (basename
+   * relative to JMeter cwd / absolute). Header Authorization uses ${authToken}.
+   */
+  authCsvPath?: string;
+  authHeaderName?: string;
 }): string {
   const threads = Math.max(1, opts.load.virtualUsers);
   const ramp = Math.max(0, opts.load.rampUpSec);
   const duration = Math.max(1, opts.load.durationSec);
+  const authHeader = opts.authHeaderName || 'Authorization';
 
   const samplers: ResolvedLoadSampler[] =
     opts.samplers && opts.samplers.length
@@ -159,7 +213,34 @@ export function buildHttpLoadJmx(opts: {
           },
         ];
 
-  const samplersXml = samplers.map(samplerXml).join('\n');
+  // Inject ${authToken} into headers when CSV auth is enabled
+  const withAuth = opts.authCsvPath
+    ? samplers.map((s) => ({
+        ...s,
+        headers: {
+          ...(s.headers || {}),
+          [authHeader]: '${authToken}',
+        },
+      }))
+    : samplers;
+
+  const csvXml = opts.authCsvPath
+    ? `
+        <CSVDataSet guiclass="TestBeanGUI" testclass="CSVDataSet" testname="Auth tokens CSV" enabled="true">
+          <stringProp name="filename">${xmlEscape(opts.authCsvPath)}</stringProp>
+          <stringProp name="fileEncoding">UTF-8</stringProp>
+          <stringProp name="variableNames">authToken</stringProp>
+          <boolProp name="ignoreFirstLine">true</boolProp>
+          <stringProp name="delimiter">,</stringProp>
+          <boolProp name="quotedData">true</boolProp>
+          <boolProp name="recycle">true</boolProp>
+          <boolProp name="stopThread">false</boolProp>
+          <stringProp name="shareMode">shareMode.all</stringProp>
+        </CSVDataSet>
+        <hashTree/>`
+    : '';
+
+  const samplersXml = withAuth.map(samplerXml).join('\n');
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
@@ -193,6 +274,7 @@ export function buildHttpLoadJmx(opts: {
         <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
       </ThreadGroup>
       <hashTree>
+${csvXml}
 ${samplersXml}
         <ResultCollector guiclass="SimpleDataWriter" testclass="ResultCollector" testname="Write results" enabled="true">
           <boolProp name="ResultCollector.error_logging">false</boolProp>
@@ -217,7 +299,7 @@ ${samplersXml}
               <fieldNames>true</fieldNames>
               <responseHeaders>false</responseHeaders>
               <requestHeaders>false</requestHeaders>
-              <responseDataOnError>false</responseDataOnError>
+              <responseDataOnError>true</responseDataOnError>
               <saveAssertionResultsFailureMessage>true</saveAssertionResultsFailureMessage>
               <assertionsResultsToSave>0</assertionsResultsToSave>
               <bytes>true</bytes>
@@ -245,6 +327,8 @@ export function writeHttpLoadJmx(
     targetUrl: string;
     load: WebLoadConfig;
     samplers?: ResolvedLoadSampler[];
+    authCsvPath?: string;
+    authHeaderName?: string;
   },
 ): void {
   writeFileSync(filePath, buildHttpLoadJmx(opts), 'utf8');

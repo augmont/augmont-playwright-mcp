@@ -8,6 +8,20 @@ import type {
   WebLoadTestCase,
 } from '@/lib/types';
 import type { ResolvedLoadSampler } from '@/server/jmeter-jmx';
+import { ensureLgdApiV1Base } from '@/lib/api-url';
+import { applyParamsToPath } from '@/lib/load-request-params';
+import { resolveOutgoingBody } from '@/lib/load-request-body';
+import {
+  expandDynamicRecord,
+  expandDynamicString,
+} from '@/lib/load-dynamic-vars';
+import { defaultLoadP99Ms, resolveLoadThresholds } from '@/lib/load-grade-summary';
+import {
+  applyApiMappingsToStep,
+  listJsonExtracts,
+  normalizeApiMappings,
+  normalizeJsonExtracts,
+} from '@/lib/load-chain';
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const STORE_PATH = path.join(DATA_DIR, 'web-load-cases.json');
@@ -51,24 +65,81 @@ function normalizeRequests(raw: unknown): WebLoadRequestStep[] | undefined {
       }
       if (!Object.keys(headers).length) headers = undefined;
     }
-    let extractJson: WebLoadRequestStep['extractJson'];
-    const rawExtract = (r as { extractJson?: unknown }).extractJson;
-    if (rawExtract && typeof rawExtract === 'object') {
-      const ex = rawExtract as {
-        varName?: unknown;
-        jsonPath?: unknown;
-        defaultValue?: unknown;
-      };
-      const varName = String(ex.varName || '').trim();
-      const jsonPath = String(ex.jsonPath || '').trim();
-      if (varName && jsonPath) {
-        extractJson = {
-          varName,
-          jsonPath,
-          defaultValue:
-            ex.defaultValue != null ? String(ex.defaultValue) : undefined,
-        };
+    let extractJsons = normalizeJsonExtracts(
+      (r as { extractJsons?: unknown }).extractJsons,
+    );
+    const legacyExtract = normalizeJsonExtracts(
+      (r as { extractJson?: unknown }).extractJson,
+    );
+    if (!extractJsons?.length && legacyExtract?.length) {
+      extractJsons = legacyExtract;
+    }
+    const extractJson = extractJsons?.[0];
+    const apiMappings = normalizeApiMappings(
+      (r as { apiMappings?: unknown }).apiMappings,
+    );
+    let pathParams: Record<string, string> | undefined;
+    if (r.pathParams && typeof r.pathParams === 'object') {
+      pathParams = {};
+      for (const [k, v] of Object.entries(r.pathParams)) {
+        if (k) pathParams[String(k)] = v == null ? '' : String(v);
       }
+      if (!Object.keys(pathParams).length) pathParams = undefined;
+    }
+    let queryParams: Record<string, string> | undefined;
+    if (r.queryParams && typeof r.queryParams === 'object') {
+      queryParams = {};
+      for (const [k, v] of Object.entries(r.queryParams)) {
+        if (k) queryParams[String(k)] = v == null ? '' : String(v);
+      }
+      if (!Object.keys(queryParams).length) queryParams = undefined;
+    }
+    let paramDefs: WebLoadRequestStep['paramDefs'];
+    if (Array.isArray((r as { paramDefs?: unknown }).paramDefs)) {
+      paramDefs = ((r as { paramDefs: unknown[] }).paramDefs || [])
+        .filter((p): p is Record<string, unknown> => !!p && typeof p === 'object')
+        .map((p) => ({
+          name: String(p.name || '').trim(),
+          in: (['path', 'query', 'header', 'body'].includes(String(p.in))
+            ? String(p.in)
+            : 'query') as NonNullable<WebLoadRequestStep['paramDefs']>[number]['in'],
+          required: Boolean(p.required),
+          type: p.type != null ? String(p.type) : undefined,
+          description: p.description != null ? String(p.description) : undefined,
+          example: p.example != null ? String(p.example) : undefined,
+        }))
+        .filter((p) => p.name);
+      if (!paramDefs.length) paramDefs = undefined;
+    }
+    let bodyRequired: string[] | undefined;
+    if (Array.isArray((r as { bodyRequired?: unknown }).bodyRequired)) {
+      bodyRequired = (r as { bodyRequired: unknown[] }).bodyRequired
+        .map(String)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (!bodyRequired.length) bodyRequired = undefined;
+    }
+    const bodyModes = ['none', 'form-data', 'urlencoded', 'raw', 'binary', 'graphql'] as const;
+    const bodyMode = bodyModes.includes(r.bodyMode as (typeof bodyModes)[number])
+      ? (r.bodyMode as (typeof bodyModes)[number])
+      : undefined;
+    const rawLangs = ['text', 'javascript', 'json', 'html', 'xml'] as const;
+    const rawLanguage = rawLangs.includes(r.rawLanguage as (typeof rawLangs)[number])
+      ? (r.rawLanguage as (typeof rawLangs)[number])
+      : undefined;
+    let formFields: WebLoadRequestStep['formFields'];
+    if (Array.isArray(r.formFields)) {
+      formFields = (r.formFields as unknown[])
+        .filter((f): f is Record<string, unknown> => !!f && typeof f === 'object')
+        .map((f, i) => ({
+          id: String(f.id || `ff-${i}`),
+          key: String(f.key || ''),
+          value: f.value == null ? '' : String(f.value),
+          type: f.type === 'file' ? ('file' as const) : ('text' as const),
+          enabled: f.enabled !== false,
+          contentType: f.contentType != null ? String(f.contentType) : undefined,
+        }));
+      if (!formFields.length) formFields = undefined;
     }
     out.push({
       name: r.name != null ? String(r.name) : undefined,
@@ -76,13 +147,75 @@ function normalizeRequests(raw: unknown): WebLoadRequestStep[] | undefined {
       method,
       headers,
       body: r.body != null ? String(r.body) : undefined,
+      bodyMode,
+      rawLanguage,
+      formFields,
+      graphqlQuery: r.graphqlQuery != null ? String(r.graphqlQuery) : undefined,
+      graphqlVariables:
+        r.graphqlVariables != null ? String(r.graphqlVariables) : undefined,
+      binaryFileName:
+        r.binaryFileName != null ? String(r.binaryFileName) : undefined,
+      binaryBase64: r.binaryBase64 != null ? String(r.binaryBase64) : undefined,
+      apiDefinition: normalizeApiDefinition(
+        (r as { apiDefinition?: unknown }).apiDefinition,
+      ),
+      pathParams,
+      queryParams,
+      paramDefs,
+      bodyRequired,
       useApiBase: Boolean(r.useApiBase),
       thinkTimeMs:
         r.thinkTimeMs != null ? clampInt(r.thinkTimeMs, 0, 0, 30_000) : undefined,
       extractJson,
+      extractJsons,
+      apiMappings,
     });
   }
   return out.length ? out : undefined;
+}
+
+function normalizeApiDefinition(raw: unknown): WebLoadRequestStep['apiDefinition'] {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const d = raw as Record<string, unknown>;
+  const responses = Array.isArray(d.responses)
+    ? d.responses
+        .filter((x): x is Record<string, unknown> => !!x && typeof x === 'object')
+        .map((x) => ({
+          status: String(x.status || ''),
+          description: x.description != null ? String(x.description) : undefined,
+          contentType: x.contentType != null ? String(x.contentType) : undefined,
+          example: x.example != null ? String(x.example) : undefined,
+          schemaPreview:
+            x.schemaPreview != null ? String(x.schemaPreview) : undefined,
+        }))
+        .filter((x) => x.status)
+    : undefined;
+  const out: NonNullable<WebLoadRequestStep['apiDefinition']> = {
+    summary: d.summary != null ? String(d.summary) : undefined,
+    description: d.description != null ? String(d.description) : undefined,
+    operationId: d.operationId != null ? String(d.operationId) : undefined,
+    tags: Array.isArray(d.tags) ? d.tags.map(String).filter(Boolean) : undefined,
+    requestBodyDescription:
+      d.requestBodyDescription != null
+        ? String(d.requestBodyDescription)
+        : undefined,
+    requestContentType:
+      d.requestContentType != null ? String(d.requestContentType) : undefined,
+    requestExample:
+      d.requestExample != null ? String(d.requestExample) : undefined,
+    requestSchemaPreview:
+      d.requestSchemaPreview != null
+        ? String(d.requestSchemaPreview)
+        : undefined,
+    responses: responses?.length ? responses : undefined,
+  };
+  const has =
+    out.summary ||
+    out.description ||
+    out.requestExample ||
+    out.requestSchemaPreview ||
+    out.responses?.length;
+  return has ? out : undefined;
 }
 
 function normalizeLoad(raw: Partial<WebLoadConfig> | undefined): WebLoadConfig | null {
@@ -117,9 +250,53 @@ function normalizeLoad(raw: Partial<WebLoadConfig> | undefined): WebLoadConfig |
     rampUpSec: clampInt(raw.rampUpSec, 5, 0, 120),
     maxErrorRatePct: clampInt(raw.maxErrorRatePct, 5, 0, 100),
     p95Ms: clampInt(raw.p95Ms, 2000, 50, 120_000),
+    ...(() => {
+      const p95 = clampInt(raw.p95Ms, 2000, 50, 120_000);
+      const resolved = resolveLoadThresholds({
+        maxErrorRatePct: clampInt(raw.maxErrorRatePct, 5, 0, 100),
+        p50Ms: raw.p50Ms as number | undefined,
+        p75Ms: raw.p75Ms as number | undefined,
+        p90Ms: raw.p90Ms as number | undefined,
+        p95Ms: p95,
+        p99Ms: raw.p99Ms as number | undefined,
+        avgMs: raw.avgMs as number | undefined,
+        maxAvgLatencyMs: raw.maxAvgLatencyMs as number | undefined,
+        maxAvgConnectMs: raw.maxAvgConnectMs as number | undefined,
+        virtualUsers: clampInt(raw.virtualUsers, 10, 1, 100),
+        durationSec: clampInt(raw.durationSec, 30, 5, 600),
+      });
+      return {
+        p50Ms: clampInt(resolved.p50Ms, resolved.p50Ms, 50, 120_000),
+        p75Ms: clampInt(resolved.p75Ms, resolved.p75Ms, 50, 120_000),
+        p90Ms: clampInt(resolved.p90Ms, resolved.p90Ms, 50, 120_000),
+        p99Ms: clampInt(resolved.p99Ms, defaultLoadP99Ms(p95), 50, 120_000),
+        avgMs: clampInt(resolved.avgMs, resolved.avgMs, 50, 120_000),
+        maxAvgLatencyMs: clampInt(
+          resolved.avgLatencyMs,
+          resolved.avgLatencyMs,
+          10,
+          120_000,
+        ),
+        maxAvgConnectMs: clampInt(
+          resolved.avgConnectMs,
+          resolved.avgConnectMs,
+          10,
+          120_000,
+        ),
+      };
+    })(),
     useApiBase: Boolean(raw.useApiBase),
     requests,
     profile,
+    requiresAuth: Boolean(raw.requiresAuth),
+    swaggerUrl: raw.swaggerUrl ? String(raw.swaggerUrl).trim() : undefined,
+    operationId: raw.operationId ? String(raw.operationId).trim() : undefined,
+    operationTags: Array.isArray(raw.operationTags)
+      ? raw.operationTags.map(String).filter(Boolean)
+      : undefined,
+    apiBaseUrl: raw.apiBaseUrl
+      ? ensureLgdApiV1Base(String(raw.apiBaseUrl).trim()) || undefined
+      : undefined,
   };
 }
 
@@ -308,6 +485,12 @@ function buildSeed(): WebLoadTestCase[] {
             headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
             body: '{"key":"country"}',
             thinkTimeMs: 200,
+            extractJsons: [
+              {
+                varName: 'locCountryId',
+                jsonPath: '$.data.country[0].id',
+              },
+            ],
             extractJson: {
               varName: 'locCountryId',
               jsonPath: '$.data.country[0].id',
@@ -321,6 +504,20 @@ function buildSeed(): WebLoadTestCase[] {
             headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
             body: '{"key":"state","value":"${locCountryId}"}',
             thinkTimeMs: 200,
+            apiMappings: [
+              {
+                id: 'map-country-to-value',
+                sourceVar: 'locCountryId',
+                target: 'body',
+                targetKey: 'value',
+              },
+            ],
+            extractJsons: [
+              {
+                varName: 'locStateId',
+                jsonPath: '$.data[0].id',
+              },
+            ],
             extractJson: {
               varName: 'locStateId',
               jsonPath: '$.data[0].id',
@@ -334,6 +531,14 @@ function buildSeed(): WebLoadTestCase[] {
             headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
             body: '{"key":"city","value":"${locStateId}"}',
             thinkTimeMs: 150,
+            apiMappings: [
+              {
+                id: 'map-state-to-value',
+                sourceVar: 'locStateId',
+                target: 'body',
+                targetKey: 'value',
+              },
+            ],
           },
         ],
       },
@@ -412,7 +617,189 @@ function normalizeCase(input: unknown): WebLoadTestCase | null {
 }
 
 export function listWebLoadCases(): WebLoadTestCase[] {
-  return readCases();
+  const cases = readCases();
+  const consolidated = consolidateFragmentedSwaggerCases(cases);
+  if (consolidated.changed) {
+    writeStore(consolidated.cases);
+    return consolidated.cases;
+  }
+  return cases;
+}
+
+/**
+ * Convert per-API Swagger import cards into one main "Swagger · …" suite
+ * with all APIs as internal request scenarios.
+ */
+export function consolidateFragmentedSwaggerCases(cases: WebLoadTestCase[]): {
+  cases: WebLoadTestCase[];
+  changed: boolean;
+  suites: string[];
+} {
+  const fragments: WebLoadTestCase[] = [];
+  const keep: WebLoadTestCase[] = [];
+
+  for (const c of cases) {
+    const isSwagger =
+      Boolean(c.load.swaggerUrl) ||
+      (c.tags || []).includes('swagger') ||
+      /^swagger-/i.test(c.id);
+    const isAlreadySuite =
+      (c.load.requests?.length || 0) > 1 ||
+      /^Swagger\s*·/i.test(c.name) ||
+      (c.tags || []).includes('suite');
+    const looksLikePerApi =
+      isSwagger &&
+      !isAlreadySuite &&
+      (/^API load ·/i.test(c.name) ||
+        /^swagger-(get|post|put|patch|delete|head)-/i.test(c.id));
+
+    if (looksLikePerApi) fragments.push(c);
+    else keep.push(c);
+  }
+
+  if (fragments.length < 2) {
+    return { cases, changed: false, suites: [] };
+  }
+
+  const byUrl = new Map<string, WebLoadTestCase[]>();
+  for (const c of fragments) {
+    const key = (c.load.swaggerUrl || c.group || 'swagger').trim() || 'swagger';
+    const list = byUrl.get(key) || [];
+    list.push(c);
+    byUrl.set(key, list);
+  }
+
+  const suites: string[] = [];
+  const next = [...keep];
+
+  for (const [swaggerUrl, group] of byUrl) {
+    if (group.length < 2) {
+      next.push(...group);
+      continue;
+    }
+
+    // Prefer stable order from original array
+    const requests = group.map((c) => {
+      const stepName = c.name.replace(/^API load ·\s*/i, '').trim() || c.load.targetUrl;
+      return {
+        name: stepName.slice(0, 100),
+        path: c.load.targetUrl,
+        method: c.load.method,
+        useApiBase: c.load.useApiBase ?? true,
+        headers: c.load.headers || { Accept: 'application/json' },
+        body: c.load.body,
+        thinkTimeMs: 150,
+      };
+    });
+
+    const first = group[0];
+    const anyAuth = group.some((c) => c.load.requiresAuth);
+    let title = 'API';
+    try {
+      const host = new URL(swaggerUrl).hostname.replace(/^api\./, '');
+      title = host.split('.')[0] || 'API';
+      title = title.charAt(0).toUpperCase() + title.slice(1);
+    } catch {
+      title = (first.group || 'API').replace(/^swagger:/i, '') || 'API';
+    }
+    // Prefer API title from first description if present
+    if (first.group?.startsWith('swagger:')) {
+      title = first.group.slice('swagger:'.length) || title;
+    }
+
+    const titleSlug = slugify(title) || 'api';
+    const suiteId = `swagger-${titleSlug}`;
+    const existingSuiteIdx = next.findIndex((c) => c.id === suiteId);
+
+    const suite: WebLoadTestCase = {
+      id: suiteId,
+      name: `Swagger · ${title}`.slice(0, 120),
+      description: [
+        `Main Swagger load suite consolidated from ${group.length} imported APIs.`,
+        swaggerUrl.startsWith('http') ? `Source: ${swaggerUrl}.` : '',
+        `Auto load: ${first.load.virtualUsers || 10} VUs · ${first.load.durationSec || 30}s.`,
+        anyAuth
+          ? 'Includes auth-required APIs — credentials/token applied at run time.'
+          : '',
+      ]
+        .filter(Boolean)
+        .join(' '),
+      tags: [
+        'web-load',
+        'swagger',
+        'api',
+        'suite',
+        ...(anyAuth ? ['auth'] : ['public']),
+      ],
+      estimatedMinutes: Math.max(
+        2,
+        Math.min(15, Math.ceil(group.length / 20)),
+      ),
+      kind: 'web-load',
+      source: first.source === 'claude' ? 'claude' : 'upload',
+      group: `swagger:${title}`,
+      load: {
+        targetUrl: first.load.targetUrl,
+        method: first.load.method,
+        useApiBase: true,
+        headers: first.load.headers || { Accept: 'application/json' },
+        body: first.load.body,
+        virtualUsers: first.load.virtualUsers || 10,
+        durationSec: first.load.durationSec || 30,
+        rampUpSec: first.load.rampUpSec || 5,
+        maxErrorRatePct: first.load.maxErrorRatePct || 10,
+        p95Ms: first.load.p95Ms || 4000,
+        p50Ms: first.load.p50Ms,
+        p75Ms: first.load.p75Ms,
+        p90Ms: first.load.p90Ms,
+        p99Ms:
+          first.load.p99Ms ||
+          defaultLoadP99Ms(first.load.p95Ms || 4000, first.load.p99Ms),
+        avgMs: first.load.avgMs,
+        maxAvgLatencyMs: first.load.maxAvgLatencyMs,
+        maxAvgConnectMs: first.load.maxAvgConnectMs,
+        profile: 'advanced',
+        requiresAuth: anyAuth,
+        swaggerUrl: first.load.swaggerUrl || (swaggerUrl.startsWith('http') ? swaggerUrl : undefined),
+        operationTags: Array.from(
+          new Set(group.flatMap((c) => c.load.operationTags || [])),
+        ).slice(0, 12),
+        requests,
+      },
+    };
+
+    if (existingSuiteIdx >= 0) {
+      // Merge requests if suite already exists
+      const existing = next[existingSuiteIdx];
+      const seen = new Set(
+        (existing.load.requests || []).map(
+          (r) => `${(r.method || 'GET').toUpperCase()} ${r.path}`,
+        ),
+      );
+      const merged = [...(existing.load.requests || [])];
+      for (const r of requests) {
+        const key = `${(r.method || 'GET').toUpperCase()} ${r.path}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          merged.push(r);
+        }
+      }
+      next[existingSuiteIdx] = {
+        ...existing,
+        ...suite,
+        load: {
+          ...suite.load,
+          requests: merged,
+        },
+        description: suite.description,
+      };
+    } else {
+      next.push(suite);
+    }
+    suites.push(suiteId);
+  }
+
+  return { cases: next, changed: true, suites };
 }
 
 export function listWebLoadMetas(): TestCaseMeta[] {
@@ -509,6 +896,19 @@ export function resolveLoadPathUrl(
   return joinBase(root, t);
 }
 
+/** Effective API base for a load case (case override → run apiUrl). */
+export function resolveCaseApiUrl(
+  test: WebLoadTestCase,
+  apiUrl?: string,
+): string | undefined {
+  const override = test.load.apiBaseUrl?.trim();
+  if (override) {
+    return ensureLgdApiV1Base(override) || undefined;
+  }
+  const fallback = apiUrl?.trim();
+  return fallback ? ensureLgdApiV1Base(fallback) || undefined : undefined;
+}
+
 /** Resolve target URL for a run (absolute or relative to base/api). */
 export function resolveLoadTargetUrl(
   test: WebLoadTestCase,
@@ -519,7 +919,7 @@ export function resolveLoadTargetUrl(
     test.load.targetUrl,
     test.load.useApiBase,
     baseUrl,
-    apiUrl,
+    resolveCaseApiUrl(test, apiUrl),
   );
 }
 
@@ -530,19 +930,45 @@ export function resolveLoadSamplers(
   apiUrl?: string,
 ): ResolvedLoadSampler[] {
   const { load } = test;
+  const effectiveApi = resolveCaseApiUrl(test, apiUrl);
   if (load.requests?.length) {
     return load.requests.map((r, i) => {
-      const method = r.method || load.method || 'GET';
-      const useApi = r.useApiBase ?? load.useApiBase;
-      const url = resolveLoadPathUrl(r.path, useApi, baseUrl, apiUrl);
+      const mapped = applyApiMappingsToStep(r);
+      const method = mapped.method || load.method || 'GET';
+      const useApi = mapped.useApiBase ?? load.useApiBase;
+      const resolvedPath = applyParamsToPath(mapped, { mode: 'jmeter' });
+      const url = resolveLoadPathUrl(resolvedPath, useApi, baseUrl, effectiveApi);
+      const outgoing = resolveOutgoingBody({
+        ...mapped,
+        method,
+        body: mapped.body != null ? mapped.body : i === 0 ? load.body : undefined,
+        headers: mapped.headers || load.headers,
+      });
+      const headers = expandDynamicRecord(outgoing.headers, 'jmeter');
+      const body = expandDynamicString(
+        outgoing.bodyEncoding === 'base64'
+          ? undefined
+          : outgoing.formPairs?.length
+            ? undefined
+            : outgoing.body,
+        'jmeter',
+      );
+      const formPairs = outgoing.formPairs?.map((p) => ({
+        name: p.name,
+        value: expandDynamicString(p.value, 'jmeter') || '',
+      }));
+      const extracts = listJsonExtracts(mapped);
       return {
-        name: r.name || `${method} ${r.path}`,
+        name: mapped.name || `${method} ${mapped.path}`,
         url,
         method,
-        headers: r.headers || load.headers,
-        body: r.body != null ? r.body : i === 0 ? load.body : undefined,
-        thinkTimeMs: r.thinkTimeMs,
-        extractJson: r.extractJson,
+        headers,
+        body,
+        multipart: outgoing.multipart,
+        formPairs,
+        thinkTimeMs: mapped.thinkTimeMs,
+        extractJson: extracts[0],
+        extractJsons: extracts.length ? extracts : undefined,
       };
     });
   }
@@ -551,8 +977,8 @@ export function resolveLoadSamplers(
       name: `${load.method || 'GET'} ${load.targetUrl}`,
       url: resolveLoadTargetUrl(test, baseUrl, apiUrl),
       method: load.method || 'GET',
-      headers: load.headers,
-      body: load.body,
+      headers: expandDynamicRecord(load.headers, 'jmeter'),
+      body: expandDynamicString(load.body, 'jmeter'),
     },
   ];
 }
