@@ -9,6 +9,7 @@ Standalone Playwright test runner with a live MCP-style browser view for the Aug
 3. **AI (OpenRouter gpt-4o)** — prompt-wise generate test cases; upload JSON/MD/TXT to **replace** matching ids or **add** new ones (`OPENROUTER_API_KEY`).
 4. **Run workspace (30% / 70%)** — step overview + live MCP screencast; country picker for Signup & Login.
 5. **Last 5 reports** — inside the workspace via **Reports** drawer; PDF under `data/reports/`.
+6. **VAPT CLI** — run the login VAPT suite from the terminal (runtime AI multi-query + fail-level on pass).
 
 ## Quick start
 
@@ -25,6 +26,25 @@ Open [http://localhost:3100](http://localhost:3100).
 1. Enter **Portal URL** (`http://localhost:4200`) and **API URL** (`http://localhost:3000/api/v1`)
 2. On **Web test cases**: use **Generate with AI** or **Upload**, then open a suite
 3. For Signup & Login: choose **All countries** or **Single country**, then **Start test**
+
+### VAPT suite CLI
+
+```bash
+# List suites
+npm run vapt -- list
+
+# Run main login suite (baseline → AI multi queries → fail-level on pass)
+npm run vapt -- run \
+  --base-url http://localhost:4200 \
+  --api-url http://localhost:3000/api/v1
+
+# Subset of checks / disable runtime AI
+npm run vapt -- run --checks sql-injection-surface,xss-reflection
+npm run vapt -- run --no-runtime-ai
+```
+
+Exit code `0` = gate passed (`completed`), `1` = failed/stopped. Report lands in `data/run-history.json` + PDF under `data/reports/`.
+Uses `OPENROUTER_API_KEY` / `ANTHROPIC_API_KEY` from `.env.local` when runtime AI is on (falls back to built-in query templates if missing).
 
 ## Project layout
 

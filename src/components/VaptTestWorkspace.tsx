@@ -16,6 +16,7 @@ import type {
   VaptTestCase,
 } from '@/lib/types';
 import { countAttacks } from '@/lib/vapt-attacks';
+import { aiKeysForRun } from '@/lib/ai-keys';
 
 function formatWhen(iso?: string) {
   if (!iso) return '—';
@@ -126,7 +127,40 @@ function FindingsPanel({
             {metrics.networkCaptures?.length || 0}
           </strong>
         </div>
+        <div className="load-metric-cell">
+          <span className="load-metric-label">AI rounds</span>
+          <strong className="load-metric-value">
+            {metrics.aiProbeRounds?.length || 0}
+          </strong>
+        </div>
       </div>
+
+      {metrics.aiProbeRounds && metrics.aiProbeRounds.length > 0 ? (
+        <>
+          <div className="load-metrics-section-label">
+            Runtime AI rounds (multi → fail-level on pass)
+          </div>
+          <ul className="vapt-findings-list">
+            {metrics.aiProbeRounds.map((r, i) => (
+              <li key={`${r.checkId}-${r.level}-${i}`} className={`vapt-finding vapt-finding-${r.status === 'ok' ? 'pass' : r.status === 'error' ? 'error' : 'info'}`}>
+                <div className="vapt-finding-head">
+                  <span className="vapt-status">{r.level}</span>
+                  <span className="vapt-status">{r.status}</span>
+                  <span className="vapt-status">{r.checkId}</span>
+                  <strong>
+                    {r.queryCount} quer{r.queryCount === 1 ? 'y' : 'ies'} · pass {r.passed} / fail{' '}
+                    {r.failed} / err {r.errors}
+                  </strong>
+                </div>
+                <p className="field-hint">
+                  {r.model ? `Model: ${r.model} · ` : ''}
+                  {r.detail || ''}
+                </p>
+              </li>
+            ))}
+          </ul>
+        </>
+      ) : null}
 
       <div className="load-metrics-section-label">Per-attack findings</div>
       <ul className="vapt-findings-list">
@@ -140,6 +174,9 @@ function FindingsPanel({
                 <div className="vapt-finding-head">
                   <span className={`vapt-sev vapt-sev-${f.severity}`}>{f.severity}</span>
                   <span className="vapt-status">{f.status}</span>
+                  {f.probeRound ? (
+                    <span className="vapt-status">{f.probeRound}</span>
+                  ) : null}
                   {f.checkId ? <span className="vapt-status">{f.checkId}</span> : null}
                   <strong>{f.title}</strong>
                 </div>
@@ -147,6 +184,8 @@ function FindingsPanel({
                   {f.category}
                   {f.owasp ? ` · ${f.owasp}` : ''}
                   {f.cwe ? ` · ${f.cwe}` : ''}
+                  {f.aiModel ? ` · AI: ${f.aiModel}` : ''}
+                  {f.aiQueryLabel ? ` · ${f.aiQueryLabel}` : ''}
                 </p>
                 {f.requestUrl ? (
                   <p className="field-hint">
@@ -354,6 +393,9 @@ export function VaptTestWorkspace({
           mode: 'vapt',
           baseUrl,
           apiUrl: apiUrl || undefined,
+          runtimeAi: true,
+          provider: useAppStore.getState().aiProvider,
+          ...aiKeysForRun(),
         }),
       });
       const data = await res.json();

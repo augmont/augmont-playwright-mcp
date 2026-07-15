@@ -58,6 +58,7 @@ Return ONLY valid JSON (no markdown fences) matching:
 
 Rules:
 - This is API VAPT (HTTP probes), NOT a UI crawl. Focus on auth, CORS, headers, cookies, error hygiene, method tamper, injection-surface hygiene.
+- Mention probeRound when relevant (baseline vs ai-multi vs ai-fail-level) and summarize aiProbeRounds.
 - Always populate preventionActions with 4–8 concrete preventions (WAF/rate-limit, auth middleware, CSP/HSTS, parameterized queries, 405 for bad methods, generic 4xx errors, SameSite cookies, TLS redirect, least-privilege routes).
 - Map findings to OWASP Top 10 / CWE when present in the payload.
 - Include 1–3 hardening snippets (Express/Next middleware, nginx headers, curl re-check) — NOT active exploit payloads.
@@ -520,12 +521,15 @@ export function buildLocalReportAiSummary(report: RunReport): ReportAiSummary {
     const vaptSnippets = buildVaptSnippets(report);
 
     if (!fails.length && !isFail) {
+      const aiRoundNote = (vapt.aiProbeRounds || []).length
+        ? ` Runtime AI ran ${vapt.aiProbeRounds!.length} query round(s) (multi + fail-level on pass).`
+        : '';
       return {
         headline: `VAPT PASS — ${report.testName}`,
         narrative: [
-          `Security probes completed with ${vapt.passed} pass / ${vapt.failed} fail / ${vapt.info} info across ${vapt.checked} checks.`,
+          `Security probes completed with ${vapt.passed} pass / ${vapt.failed} fail / ${vapt.info} info across ${vapt.checked} checks.${aiRoundNote}`,
           vapt.targetUrl ? `Target: ${vapt.targetUrl}.` : '',
-          'Baseline OWASP-oriented API/web smoke passed — keep controls in place to prevent regressions.',
+          'Baseline + AI multi/fail-level hygiene probes passed — keep controls in place to prevent regressions.',
         ]
           .filter(Boolean)
           .join(' '),
@@ -541,21 +545,31 @@ export function buildLocalReportAiSummary(report: RunReport): ReportAiSummary {
         testerActions: [
           'Attach the PDF findings + prevention section as evidence in the release checklist.',
           'Re-run the same VAPT case against staging after config changes.',
+          'Confirm AI fail-level rounds appear in the report when baseline passes.',
         ],
         studyNotes:
-          'Pass evidence shows the “good” baseline. Study preventionActions so the team knows how to keep attacks blocked after future changes.',
+          'Pass evidence shows the “good” baseline plus AI multi/fail-level rounds. Study preventionActions so the team knows how to keep attacks blocked after future changes.',
         codeSnippets: vaptSnippets,
         model: 'local-template',
       };
     }
 
     const top = fails[0];
+    const byRound = (vapt.findings || []).reduce(
+      (acc, f) => {
+        const r = f.probeRound || 'baseline';
+        acc[r] = (acc[r] || 0) + 1;
+        return acc;
+      },
+      {} as Record<string, number>,
+    );
     return {
       headline: `VAPT ${isFail || fails.length ? 'FINDINGS' : 'REVIEW'} — ${report.testName}`,
       narrative: [
         `VAPT run recorded ${vapt.failed} fail / ${vapt.passed} pass / ${vapt.info} info (${vapt.checked} checks).`,
+        `Rounds: baseline ${byRound.baseline || 0} · AI multi ${byRound['ai-multi'] || 0} · AI fail-level ${byRound['ai-fail-level'] || 0}.`,
         top
-          ? `Highest-signal issue: "${top.title}" (${top.severity}) — ${top.evidence || top.recommendation || ''}`.trim()
+          ? `Highest-signal issue: "${top.title}" (${top.severity}${top.probeRound ? ` · ${top.probeRound}` : ''}) — ${top.evidence || top.recommendation || ''}`.trim()
           : report.error || 'Review findings table for details.',
         'Use Developer actions for immediate fixes and How to prevent for lasting controls.',
       ].join(' '),
@@ -564,7 +578,7 @@ export function buildLocalReportAiSummary(report: RunReport): ReportAiSummary {
             .slice(0, 5)
             .map(
               (f) =>
-                `[${f.severity}] ${f.title}${f.recommendation ? ` — Fix: ${f.recommendation}` : ''}`,
+                `[${f.severity}${f.probeRound ? `/${f.probeRound}` : ''}] ${f.title}${f.recommendation ? ` — Fix: ${f.recommendation}` : ''}`,
             )
             .join(' ')
         : undefined,
@@ -579,10 +593,11 @@ export function buildLocalReportAiSummary(report: RunReport): ReportAiSummary {
       testerActions: [
         'Copy severity, OWASP/CWE, evidence, prevention bullets, and screenshot into the security ticket.',
         'Re-test the same VAPT case after fixes; severityGate must stay clear.',
-        'Verify network payloads no longer show the weak response pattern (open CORS, 200 unauth, stack traces).',
+        'Verify each failed finding’s probeRound (baseline / ai-multi / ai-fail-level) in the PDF.',
+        'Confirm network tab + step log include every AI query payload.',
       ],
       studyNotes:
-        'Failed VAPT findings are remediation + prevention tickets — not UI flakes. Map each finding to an owner (app / infra / API) and track the prevention control that stops regression.',
+        'Failed VAPT findings are remediation + prevention tickets — not UI flakes. Map each finding to an owner (app / infra / API) and track the prevention control that stops regression. Note whether failure was caught at baseline, AI multi, or AI fail-level escalation.',
       codeSnippets: vaptSnippets,
       model: 'local-template',
     };
@@ -748,7 +763,8 @@ export async function enrichReportWithAiSummary(report: RunReport): Promise<RunR
             failed: report.vaptFindings.failed,
             info: report.vaptFindings.info,
             bySeverity: report.vaptFindings.bySeverity,
-            findings: report.vaptFindings.findings?.slice(0, 20),
+            aiProbeRounds: report.vaptFindings.aiProbeRounds?.slice(0, 30),
+            findings: report.vaptFindings.findings?.slice(0, 30),
             networkSample: report.vaptFindings.networkCaptures?.slice(0, 8),
           })}`
         : '',

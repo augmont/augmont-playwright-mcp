@@ -30,6 +30,7 @@ import {
 } from '@/server/web-load-runner';
 import { createVaptSessionSteps, runVapt } from '@/server/vapt-runner';
 import type { RoleCredentialsMap } from '@/lib/role-credentials';
+import { sanitizeClientAiKeys } from '@/server/ai-keys-request';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -107,6 +108,12 @@ export async function POST(
     deviceVersion?: string;
     appDriveUrl?: string;
     appiumUrl?: string;
+    /** VAPT runtime AI multi-query + fail-level escalation (default true) */
+    runtimeAi?: boolean;
+    provider?: string;
+    model?: string;
+    openRouterApiKey?: string;
+    anthropicApiKey?: string;
   };
 
   const mode =
@@ -200,7 +207,15 @@ export async function POST(
       apiUrl,
       steps,
     });
-    void runVapt(runId, baseUrl, vaptCase, { apiUrl });
+    const aiKeys = sanitizeClientAiKeys(body);
+    void runVapt(runId, baseUrl, vaptCase, {
+      apiUrl,
+      runtimeAi: body.runtimeAi !== false,
+      provider: body.provider,
+      model: body.model,
+      openRouterApiKey: aiKeys.openRouterApiKey,
+      anthropicApiKey: aiKeys.anthropicApiKey,
+    });
     return NextResponse.json({ runId, snapshot: toSnapshot(session) });
   }
 

@@ -5,6 +5,7 @@ import type { RunReport, TestStep } from '@/lib/types';
 import { ModalCloseButton } from '@/components/ModalCloseButton';
 import { ReportFlowChart } from '@/components/ReportFlowChart';
 import { LoadThresholdsPanel } from '@/components/LoadThresholdsPanel';
+import { LoadLiveCharts } from '@/components/LoadLiveCharts';
 import { resolveExpectation } from '@/lib/test-expectation';
 import { ensureReportFlowChart } from '@/lib/flow-chart';
 import { buildLoadGradeSummary } from '@/lib/load-grade-summary';
@@ -604,6 +605,27 @@ export function ReportDetailModal({
                 </div>
               ) : null}
             </div>
+            {(report.loadMetrics.series?.length ||
+              report.loadMetrics.byLabel?.length ||
+              report.loadMetrics.latencyHistogram?.length) ? (
+              <div className="load-panel" style={{ margin: '0 0 1.5rem' }}>
+                <h3 className="section-title" style={{ marginTop: 0 }}>
+                  Graphs &amp; Aggregate Report
+                </h3>
+                <LoadLiveCharts metrics={report.loadMetrics} compact runId={report.runId} />
+                {report.loadMetrics.htmlReportReady && report.loadMetrics.reportDir ? (
+                  <p className="history-meta" style={{ marginTop: '0.75rem' }}>
+                    <a
+                      href={`/api/runs/${encodeURIComponent(report.runId)}/load-report/`}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Open JMeter HTML Dashboard
+                    </a>
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
             </>
           ) : null}
 

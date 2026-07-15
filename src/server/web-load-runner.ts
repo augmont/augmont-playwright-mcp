@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import path from 'path';
 import { chromium, type Browser, type CDPSession, type Page } from 'playwright';
 import type {
@@ -30,6 +30,7 @@ import {
 import { resolveLoadSamplers, resolveLoadTargetUrl } from '@/server/web-load-store';
 import {
   ensureJmeterBin,
+  generateJmeterHtmlReport,
   killJmeterProcess,
   spawnJmeter,
 } from '@/server/jmeter-cli';
@@ -166,6 +167,8 @@ export async function runWebLoad(
     logLines = pushLog(logLines, line);
   };
 
+  let htmlReportReady = false;
+
   const emitMetricsFromAgg = (agg: ReturnType<typeof parseJtlFile>) => {
     const metrics = jtlToMetrics(agg, {
       virtualUsers: load.virtualUsers,
@@ -174,6 +177,7 @@ export async function runWebLoad(
       jtlPath: path.relative(process.cwd(), jtlPath),
       jmxPath: path.relative(process.cwd(), jmxPath),
       reportDir: path.relative(process.cwd(), reportDir),
+      htmlReportReady,
       logLines,
     });
     updateLoadMetrics(runId, metrics);
@@ -448,8 +452,7 @@ export async function runWebLoad(
       jmxPath,
       jtlPath,
       logFile: jmeterLog,
-      // HTML report only after successful long runs can be slow; skip during short default runs
-      reportDir: load.durationSec >= 45 ? reportDir : undefined,
+      // HTML dashboard is generated post-run via -g (faster live finish)
       onStdout: (line) => onLog(`[jmeter] ${line}`),
       onStderr: (line) => onLog(`[jmeter:err] ${line}`),
     });
@@ -463,7 +466,7 @@ export async function runWebLoad(
     if (signal.aborted) throw new Error('Load test stopped');
 
     const finalAgg = parseJtlFile(jtlPath);
-    const finalMetrics = emitMetricsFromAgg(finalAgg);
+    let finalMetrics = emitMetricsFromAgg(finalAgg);
 
     if (result.code && result.code !== 0 && finalMetrics.totalRequests === 0) {
       throw new Error(
@@ -479,7 +482,30 @@ export async function runWebLoad(
     onLog(
       `JMeter finished · requests=${finalMetrics.totalRequests} err%=${finalMetrics.errorRatePct} p95=${finalMetrics.p95Ms} p99=${finalMetrics.p99Ms}`,
     );
-    emitMetricsFromAgg(finalAgg);
+
+    // —— 3b) Post-run HTML Dashboard (jmeter -g) ——
+    if (finalMetrics.totalRequests > 0 && !signal.aborted) {
+      onLog('Generating JMeter HTML Dashboard…');
+      try {
+        const html = await generateJmeterHtmlReport({
+          jmeterBin,
+          jtlPath,
+          reportDir,
+          onLog,
+        });
+        if (html.ok && existsSync(path.join(reportDir, 'index.html'))) {
+          htmlReportReady = true;
+          onLog(html.message);
+        } else {
+          onLog(`HTML report skipped: ${html.message}`);
+        }
+      } catch (err) {
+        onLog(
+          `HTML report error: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    finalMetrics = emitMetricsFromAgg(finalAgg);
 
     // Crisp final MCP frame + report screenshot (portal loads only)
     let finalShot: string | undefined;

@@ -15,6 +15,7 @@ import {
 import { LoadAuthCredentialsModal } from '@/components/LoadAuthCredentialsModal';
 import { SwaggerSuiteEditModal } from '@/components/SwaggerSuiteEditModal';
 import { LoadGradeSummaryPanel } from '@/components/LoadGradeSummaryPanel';
+import { LoadLiveCharts } from '@/components/LoadLiveCharts';
 import { LoadThresholdsPanel } from '@/components/LoadThresholdsPanel';
 import { buildLoadGradeSummary } from '@/lib/load-grade-summary';
 import type {
@@ -25,7 +26,7 @@ import type {
   WebLoadTestCase,
 } from '@/lib/types';
 
-type PageView = 'live' | 'report' | 'thresholds';
+type PageView = 'live' | 'graphs' | 'report' | 'thresholds';
 
 function formatWhen(iso?: string) {
   if (!iso) return '—';
@@ -56,9 +57,17 @@ function formatBytes(n?: number): string {
   return `${Math.round((n / (1024 * 1024)) * 100) / 100} MB`;
 }
 
-function MetricCell({ label, value }: { label: string; value: string | number }) {
+function MetricCell({
+  label,
+  value,
+  title,
+}: {
+  label: string;
+  value: string | number;
+  title?: string;
+}) {
   return (
-    <div className="load-metric-cell">
+    <div className="load-metric-cell" title={title}>
       <span className="load-metric-label">{label}</span>
       <strong className="load-metric-value">{value}</strong>
     </div>
@@ -85,55 +94,136 @@ function MetricsPanel({
     <div className="load-metrics-wrap">
       <div className="load-metrics-section-label">Traffic</div>
       <div className="load-metrics-grid">
-        <MetricCell label="Engine" value={metrics.engine || 'jmeter'} />
-        <MetricCell label="Requests" value={metrics.totalRequests} />
-        <MetricCell label="RPS" value={metrics.rps} />
+        <MetricCell
+          label="Engine"
+          value={metrics.engine || 'jmeter'}
+          title="Apache JMeter CLI drives HTTP load"
+        />
+        <MetricCell
+          label="Requests"
+          value={metrics.totalRequests}
+          title="# Samples — total sampler results (OK + errors)"
+        />
+        <MetricCell
+          label="RPS"
+          value={metrics.rps}
+          title="Throughput — requests per second over wall-clock (JMeter Aggregate)"
+        />
         {metrics.rpsLive != null ? (
-          <MetricCell label="RPS (15s)" value={metrics.rpsLive} />
+          <MetricCell
+            label="RPS (15s)"
+            value={metrics.rpsLive}
+            title="Hits per second over the last ~15 seconds (smoother live view)"
+          />
         ) : null}
         <MetricCell
           label="Threads"
           value={`${metrics.latestThreads ?? metrics.jmeterThreads ?? metrics.activeUsers}/${metrics.virtualUsers}`}
+          title="Active / configured virtual users (JMeter allThreads)"
         />
-        <MetricCell label="Elapsed" value={`${metrics.elapsedSec}s`} />
-        <MetricCell label="OK" value={metrics.successCount} />
-        <MetricCell label="Errors" value={metrics.errorCount} />
-        <MetricCell label="Success %" value={`${metrics.successRatePct ?? 100 - metrics.errorRatePct}%`} />
-        <MetricCell label="Error %" value={`${metrics.errorRatePct}%`} />
+        <MetricCell
+          label="Elapsed"
+          value={`${metrics.elapsedSec}s`}
+          title="Wall-clock seconds since the load run started"
+        />
+        <MetricCell label="OK" value={metrics.successCount} title="Successful samples" />
+        <MetricCell label="Errors" value={metrics.errorCount} title="Failed samples" />
+        <MetricCell
+          label="Success %"
+          value={`${metrics.successRatePct ?? 100 - metrics.errorRatePct}%`}
+          title="(OK / total samples) × 100"
+        />
+        <MetricCell
+          label="Error %"
+          value={`${metrics.errorRatePct}%`}
+          title="(Errors / total samples) × 100 — keep under your SLA"
+        />
       </div>
 
       <div className="load-metrics-section-label">Latency (response time)</div>
       <div className="load-metrics-grid">
-        <MetricCell label="Avg" value={`${metrics.avgMs}ms`} />
+        <MetricCell
+          label="Avg"
+          value={`${metrics.avgMs}ms`}
+          title="Mean elapsed time (request start → full response)"
+        />
         {metrics.windowAvgMs != null ? (
-          <MetricCell label="Avg (15s)" value={`${metrics.windowAvgMs}ms`} />
+          <MetricCell
+            label="Avg (15s)"
+            value={`${metrics.windowAvgMs}ms`}
+            title="Average elapsed over the last ~15 seconds"
+          />
         ) : null}
-        <MetricCell label="Min" value={`${metrics.minMs ?? 0}ms`} />
-        <MetricCell label="Max" value={`${metrics.maxMs ?? 0}ms`} />
-        <MetricCell label="Stddev" value={`${metrics.stddevMs ?? 0}ms`} />
-        <MetricCell label="p50" value={`${metrics.p50Ms}ms`} />
-        <MetricCell label="p75" value={`${metrics.p75Ms ?? '—'}${metrics.p75Ms != null ? 'ms' : ''}`} />
-        <MetricCell label="p90" value={`${metrics.p90Ms ?? '—'}${metrics.p90Ms != null ? 'ms' : ''}`} />
-        <MetricCell label="p95" value={`${metrics.p95Ms}ms`} />
-        <MetricCell label="p99" value={`${metrics.p99Ms}ms`} />
+        <MetricCell label="Min" value={`${metrics.minMs ?? 0}ms`} title="Fastest sample" />
+        <MetricCell label="Max" value={`${metrics.maxMs ?? 0}ms`} title="Slowest sample" />
+        <MetricCell
+          label="Stddev"
+          value={`${metrics.stddevMs ?? 0}ms`}
+          title="Standard deviation of elapsed times (spread / consistency)"
+        />
+        <MetricCell
+          label="p50"
+          value={`${metrics.p50Ms}ms`}
+          title="Median — 50% of samples finished at or below this"
+        />
+        <MetricCell
+          label="p75"
+          value={`${metrics.p75Ms ?? '—'}${metrics.p75Ms != null ? 'ms' : ''}`}
+          title="75th percentile elapsed"
+        />
+        <MetricCell
+          label="p90"
+          value={`${metrics.p90Ms ?? '—'}${metrics.p90Ms != null ? 'ms' : ''}`}
+          title="90th percentile elapsed"
+        />
+        <MetricCell
+          label="p95"
+          value={`${metrics.p95Ms}ms`}
+          title="95th percentile — common SLA metric"
+        />
+        <MetricCell
+          label="p99"
+          value={`${metrics.p99Ms}ms`}
+          title="99th percentile — tail latency"
+        />
         {metrics.avgLatencyMs != null ? (
-          <MetricCell label="Avg TTFB" value={`${metrics.avgLatencyMs}ms`} />
+          <MetricCell
+            label="Avg TTFB"
+            value={`${metrics.avgLatencyMs}ms`}
+            title="JMeter Latency — time to first byte"
+          />
         ) : null}
         {metrics.avgConnectMs != null ? (
-          <MetricCell label="Avg Connect" value={`${metrics.avgConnectMs}ms`} />
+          <MetricCell
+            label="Avg Connect"
+            value={`${metrics.avgConnectMs}ms`}
+            title="TCP/TLS connect time before the request is sent"
+          />
         ) : null}
       </div>
 
       <div className="load-metrics-section-label">Throughput</div>
       <div className="load-metrics-grid">
         {metrics.bytesPerSec != null ? (
-          <MetricCell label="Bytes/s" value={metrics.bytesPerSec} />
+          <MetricCell
+            label="Bytes/s"
+            value={metrics.bytesPerSec}
+            title="Received response bytes per second"
+          />
         ) : null}
         {metrics.kbPerSec != null ? (
-          <MetricCell label="KB/s" value={metrics.kbPerSec} />
+          <MetricCell
+            label="KB/s"
+            value={metrics.kbPerSec}
+            title="Received KB/sec (JMeter network throughput)"
+          />
         ) : null}
         {metrics.totalBytes != null ? (
-          <MetricCell label="Total bytes" value={formatBytes(metrics.totalBytes)} />
+          <MetricCell
+            label="Total bytes"
+            value={formatBytes(metrics.totalBytes)}
+            title="Total response body bytes received"
+          />
         ) : null}
         {metrics.sentBytesPerSec != null ? (
           <MetricCell label="Sent B/s" value={metrics.sentBytesPerSec} />
@@ -660,6 +750,18 @@ export function LoadTestWorkspace({
         <button
           type="button"
           role="tab"
+          aria-selected={view === 'graphs'}
+          className={`load-view-tab ${view === 'graphs' ? 'active' : ''}`}
+          onClick={() => setView('graphs')}
+        >
+          Graphs
+          {metrics?.series?.length ? (
+            <span className="load-status load-status-running">{metrics.series.length} pts</span>
+          ) : null}
+        </button>
+        <button
+          type="button"
+          role="tab"
           aria-selected={view === 'thresholds'}
           className={`load-view-tab ${view === 'thresholds' ? 'active' : ''}`}
           onClick={() => setView('thresholds')}
@@ -697,6 +799,18 @@ export function LoadTestWorkspace({
                 ) : null}
               </h2>
               <MetricsPanel metrics={metrics} apiOnly={apiOnly} />
+              {metrics?.series?.length ? (
+                <p className="history-meta" style={{ marginTop: '0.75rem' }}>
+                  <button
+                    type="button"
+                    className="btn btn-ghost"
+                    style={{ padding: '0.25rem 0.6rem', fontSize: '0.82rem' }}
+                    onClick={() => setView('graphs')}
+                  >
+                    Open live graphs ({metrics.series.length} points) →
+                  </button>
+                </p>
+              ) : null}
               {metrics?.jtlPath || metrics?.jmxPath ? (
                 <p className="load-artifact-paths">
                   {metrics.jmxPath ? (
@@ -714,6 +828,18 @@ export function LoadTestWorkspace({
                     <>
                       {' · '}
                       Report: <code>{metrics.reportDir}</code>
+                    </>
+                  ) : null}
+                  {runId && metrics.htmlReportReady ? (
+                    <>
+                      {' · '}
+                      <a
+                        href={`/api/runs/${encodeURIComponent(runId)}/load-report/`}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        Open JMeter HTML report
+                      </a>
                     </>
                   ) : null}
                 </p>
@@ -822,6 +948,36 @@ export function LoadTestWorkspace({
               </section>
             ) : null}
           </aside>
+        </div>
+      ) : view === 'graphs' ? (
+        <div className="load-report-view">
+          <section className="load-panel">
+            <h2 className="load-panel-title">
+              Live graphs
+              {snapshot?.status ? (
+                <span className={`load-status load-status-${snapshot.status}`}>
+                  {snapshot.status}
+                </span>
+              ) : null}
+            </h2>
+            <p className="history-meta" style={{ marginTop: 0 }}>
+              Full JMeter-style views: Over time (hits, response times, threads, KB/s, TTFB,
+              connect, cumulative), Codes, Distribution, Aggregate &amp; Summary Report, plus
+              Definitions for every metric. Updates live over SSE while JMeter writes the JTL.
+            </p>
+            <LoadLiveCharts metrics={metrics} runId={runId} />
+            {runId && metrics?.htmlReportReady ? (
+              <p className="load-artifact-paths" style={{ marginTop: '1rem' }}>
+                <a
+                  href={`/api/runs/${encodeURIComponent(runId)}/load-report/`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Open full JMeter HTML Dashboard
+                </a>
+              </p>
+            ) : null}
+          </section>
         </div>
       ) : view === 'thresholds' ? (
         <div className="load-report-view">
@@ -1028,6 +1184,24 @@ export function LoadTestWorkspace({
                   )}
                 </section>
               </div>
+
+              {metrics ? (
+                <section className="load-panel">
+                  <h2 className="load-panel-title">Graphs &amp; Aggregate Report</h2>
+                  <LoadLiveCharts metrics={metrics} runId={runId} />
+                  {runId && metrics.htmlReportReady ? (
+                    <p className="load-artifact-paths" style={{ marginTop: '0.85rem' }}>
+                      <a
+                        href={`/api/runs/${encodeURIComponent(runId)}/load-report/`}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        Open full JMeter HTML Dashboard
+                      </a>
+                    </p>
+                  ) : null}
+                </section>
+              ) : null}
 
               <section className="load-panel">
                 <h2 className="load-panel-title">

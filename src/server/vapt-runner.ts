@@ -1,6 +1,7 @@
 import { chromium, type Browser, type CDPSession, type Page, type Request } from 'playwright';
 import type {
   TestStep,
+  VaptAiProbeRoundSummary,
   VaptCheckId,
   VaptFinding,
   VaptLiveMetrics,
@@ -8,6 +9,7 @@ import type {
   VaptSeverity,
   VaptTestCase,
 } from '@/lib/types';
+import type { AiProviderId } from '@/lib/ai-provider';
 import {
   getSession,
   setFrame,
@@ -27,6 +29,11 @@ import {
 import { resolveVaptStartUrl, resolveVaptTargetUrl } from '@/server/vapt-store';
 import { countAttacks, vaptAttackLabel } from '@/lib/vapt-attacks';
 import { runCatalogueAttackProbe } from '@/server/vapt-catalogue-probes';
+import { generateRuntimeProbeQueries } from '@/server/vapt-runtime-ai';
+import {
+  checkPassedClean,
+  executeRuntimeAiQueries,
+} from '@/server/vapt-ai-probe-exec';
 
 const SEVERITY_RANK: Record<VaptSeverity, number> = {
   info: 0,
@@ -71,6 +78,7 @@ function emptyMetrics(targetUrl: string): VaptLiveMetrics {
     networkCaptures: [],
     targetUrl,
     engine: 'api-vapt',
+    aiProbeRounds: [],
   };
 }
 
@@ -78,6 +86,7 @@ function summarize(
   findings: VaptFinding[],
   targetUrl: string,
   networkCaptures: VaptNetworkCapture[],
+  aiProbeRounds?: VaptAiProbeRoundSummary[],
 ): VaptLiveMetrics {
   const bySeverity: Partial<Record<VaptSeverity, number>> = {};
   let passed = 0;
@@ -102,6 +111,22 @@ function summarize(
     networkCaptures,
     targetUrl,
     engine: 'api-vapt',
+    aiProbeRounds: aiProbeRounds || [],
+  };
+}
+
+function tagBaseline(findings: VaptFinding[]): VaptFinding[] {
+  return findings.map((f) => ({
+    ...f,
+    probeRound: f.probeRound || ('baseline' as const),
+  }));
+}
+
+function countRoundStats(batch: VaptFinding[]) {
+  return {
+    passed: batch.filter((f) => f.status === 'pass').length,
+    failed: batch.filter((f) => f.status === 'fail').length,
+    errors: batch.filter((f) => f.status === 'error').length,
   };
 }
 
@@ -1192,14 +1217,14 @@ export function createVaptSessionSteps(test: VaptTestCase): TestStep[] {
     ...attacks.map((check, index) => ({
       id: `vapt-check-${check}`,
       label: `Scenario ${index + 1}/${total} · ${vaptAttackLabel(check)}`,
-      description: `Internal attack scenario · ${vapt.method || 'GET'} ${vapt.targetUrl} · id=${check}`,
+      description: `Baseline → AI multi queries → on pass AI fail-level · ${vapt.method || 'GET'} ${vapt.targetUrl} · id=${check}`,
       status: 'pending' as const,
       action: 'assertVisible' as const,
     })),
     {
       id: 'vapt-gate',
       label: 'Severity gate + report',
-      description: `Fail if any finding ≥ ${vapt.severityGate || 'high'} · ${total} internal scenario(s)`,
+      description: `Fail if any finding ≥ ${vapt.severityGate || 'high'} · all steps/rounds/pass-fail → report`,
       status: 'pending',
       action: 'assertVisible',
     },
@@ -1210,7 +1235,14 @@ export async function runVapt(
   runId: string,
   baseUrl: string,
   test: VaptTestCase,
-  opts?: { apiUrl?: string },
+  opts?: {
+    apiUrl?: string;
+    runtimeAi?: boolean;
+    provider?: AiProviderId | string | null;
+    openRouterApiKey?: string | null;
+    anthropicApiKey?: string | null;
+    model?: string | null;
+  },
 ): Promise<void> {
   const session = getSession(runId);
   if (!session) return;
@@ -1221,8 +1253,10 @@ export async function runVapt(
   const signal = session.abortController.signal;
   const method = vapt.method || 'GET';
   const gate = vapt.severityGate || 'high';
+  const runtimeAi = opts?.runtimeAi !== false;
   let findings: VaptFinding[] = [];
   let networkCaptures: VaptNetworkCapture[] = [];
+  let aiProbeRounds: VaptAiProbeRoundSummary[] = [];
   let browser: Browser | undefined;
   let cdp: CDPSession | undefined;
   const stepIdRef = { current: 'vapt-mcp' };
@@ -1283,11 +1317,14 @@ export async function runVapt(
       if (signal.aborted) throw new Error('Stopped');
       const stepId = `vapt-check-${check}`;
       stepIdRef.current = stepId;
+      const attackLabel = vaptAttackLabel(check);
       updateStep(runId, stepId, {
         status: 'running',
-        message: `Running scenario · ${check}…`,
+        message: `Baseline · ${attackLabel}…`,
       });
-      const batch = await runCheck(check, {
+
+      // —— 1) Baseline catalogue / legacy probe ——
+      const baselineRaw = await runCheck(check, {
         targetUrl,
         baseUrl,
         apiUrl: opts?.apiUrl,
@@ -1299,6 +1336,181 @@ export async function runVapt(
         signal,
         onNetwork: pushNetwork,
       });
+      let batch = tagBaseline(baselineRaw);
+      const stepLog: string[] = [
+        `=== BASELINE (${batch.length} finding(s)) ===`,
+        ...batch.map(
+          (f) =>
+            `${f.status.toUpperCase()}: ${f.title}` +
+            (f.requestUrl ? `\n  ${f.requestMethod} ${f.requestUrl}` : '') +
+            (f.requestPayload ? `\n  payload: ${f.requestPayload.slice(0, 120)}` : ''),
+        ),
+      ];
+
+      // —— 2) Runtime AI multi-query ——
+      if (runtimeAi && !signal.aborted) {
+        updateStep(runId, stepId, {
+          status: 'running',
+          message: `AI generating multi queries · ${attackLabel}…`,
+          detail: stepLog.join('\n'),
+        });
+        try {
+          const gen = await generateRuntimeProbeQueries({
+            checkId: check,
+            level: 'multi',
+            targetUrl,
+            baseUrl,
+            method,
+            priorFindings: batch,
+            provider: opts?.provider,
+            openRouterApiKey: opts?.openRouterApiKey,
+            anthropicApiKey: opts?.anthropicApiKey,
+            model: opts?.model,
+            signal,
+          });
+          updateStep(runId, stepId, {
+            status: 'running',
+            message: `AI multi · running ${gen.queries.length} queries (${gen.source}/${gen.model})…`,
+            detail: stepLog.join('\n'),
+          });
+          const multiBatch = await executeRuntimeAiQueries(gen.queries, {
+            checkId: check,
+            stepId,
+            signal,
+            onNetwork: pushNetwork,
+            model: gen.model,
+            level: 'multi',
+          });
+          const stats = countRoundStats(multiBatch);
+          aiProbeRounds.push({
+            checkId: check,
+            level: 'multi',
+            status: 'ok',
+            model: gen.model,
+            queryCount: gen.queries.length,
+            passed: stats.passed,
+            failed: stats.failed,
+            errors: stats.errors,
+            detail: `${gen.source} · ${gen.queries.map((q) => q.label).join(', ')}`,
+            at: new Date().toISOString(),
+          });
+          batch = [...batch, ...multiBatch];
+          stepLog.push(
+            `=== AI MULTI (${gen.source}/${gen.model} · ${multiBatch.length} finding(s)) ===`,
+            ...multiBatch.map(
+              (f) =>
+                `${f.status.toUpperCase()}: ${f.title}` +
+                (f.requestUrl ? `\n  ${f.requestMethod} ${f.requestUrl}` : '') +
+                (f.requestPayload
+                  ? `\n  payload: ${f.requestPayload.slice(0, 120)}`
+                  : ''),
+            ),
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : 'AI multi failed';
+          aiProbeRounds.push({
+            checkId: check,
+            level: 'multi',
+            status: 'error',
+            queryCount: 0,
+            passed: 0,
+            failed: 0,
+            errors: 1,
+            detail: msg,
+            at: new Date().toISOString(),
+          });
+          stepLog.push(`=== AI MULTI ERROR ===\n${msg}`);
+        }
+      }
+
+      // —— 3) On pass → AI fail-level escalation ——
+      if (runtimeAi && !signal.aborted && checkPassedClean(batch, check)) {
+        updateStep(runId, stepId, {
+          status: 'running',
+          message: `Pass → AI fail-level queries · ${attackLabel}…`,
+          detail: stepLog.join('\n'),
+        });
+        try {
+          const gen = await generateRuntimeProbeQueries({
+            checkId: check,
+            level: 'fail-level',
+            targetUrl,
+            baseUrl,
+            method,
+            priorFindings: batch.filter((f) => f.checkId === check),
+            provider: opts?.provider,
+            openRouterApiKey: opts?.openRouterApiKey,
+            anthropicApiKey: opts?.anthropicApiKey,
+            model: opts?.model,
+            signal,
+          });
+          updateStep(runId, stepId, {
+            status: 'running',
+            message: `AI fail-level · running ${gen.queries.length} queries (${gen.source}/${gen.model})…`,
+            detail: stepLog.join('\n'),
+          });
+          const flBatch = await executeRuntimeAiQueries(gen.queries, {
+            checkId: check,
+            stepId,
+            signal,
+            onNetwork: pushNetwork,
+            model: gen.model,
+            level: 'fail-level',
+          });
+          const stats = countRoundStats(flBatch);
+          aiProbeRounds.push({
+            checkId: check,
+            level: 'fail-level',
+            status: 'ok',
+            model: gen.model,
+            queryCount: gen.queries.length,
+            passed: stats.passed,
+            failed: stats.failed,
+            errors: stats.errors,
+            detail: `${gen.source} · ${gen.queries.map((q) => q.label).join(', ')}`,
+            at: new Date().toISOString(),
+          });
+          batch = [...batch, ...flBatch];
+          stepLog.push(
+            `=== AI FAIL-LEVEL (${gen.source}/${gen.model} · ${flBatch.length} finding(s)) ===`,
+            ...flBatch.map(
+              (f) =>
+                `${f.status.toUpperCase()}: ${f.title}` +
+                (f.requestUrl ? `\n  ${f.requestMethod} ${f.requestUrl}` : '') +
+                (f.requestPayload
+                  ? `\n  payload: ${f.requestPayload.slice(0, 120)}`
+                  : ''),
+            ),
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : 'AI fail-level failed';
+          aiProbeRounds.push({
+            checkId: check,
+            level: 'fail-level',
+            status: 'error',
+            queryCount: 0,
+            passed: 0,
+            failed: 0,
+            errors: 1,
+            detail: msg,
+            at: new Date().toISOString(),
+          });
+          stepLog.push(`=== AI FAIL-LEVEL ERROR ===\n${msg}`);
+        }
+      } else if (runtimeAi && !checkPassedClean(batch, check)) {
+        aiProbeRounds.push({
+          checkId: check,
+          level: 'fail-level',
+          status: 'skipped',
+          queryCount: 0,
+          passed: 0,
+          failed: 0,
+          errors: 0,
+          detail: 'Skipped — baseline/multi already failed (no escalation needed)',
+          at: new Date().toISOString(),
+        });
+        stepLog.push('=== AI FAIL-LEVEL SKIPPED (already failed) ===');
+      }
 
       await paintAttackEvidence(page, {
         checkId: check,
@@ -1314,36 +1526,40 @@ export async function runVapt(
         screenshotPath: f.screenshotPath || shotPath,
       }));
       findings = [...findings, ...withShot];
-      updateVaptFindings(runId, summarize(findings, targetUrl, networkCaptures));
+      updateVaptFindings(
+        runId,
+        summarize(findings, targetUrl, networkCaptures, aiProbeRounds),
+      );
 
       const failed = batch.filter((f) => f.status === 'fail' || f.status === 'error').length;
+      const rounds = batch.reduce(
+        (acc, f) => {
+          const r = f.probeRound || 'baseline';
+          acc[r] = (acc[r] || 0) + 1;
+          return acc;
+        },
+        {} as Record<string, number>,
+      );
       updateStep(runId, stepId, {
         status: failed ? 'failed' : 'passed',
         message: failed
-          ? `${failed} finding(s) failed — attack report captured`
-          : `${batch.length} finding(s) · screenshot + network logged`,
-        detail: batch
-          .map(
-            (f) =>
-              `${f.status.toUpperCase()}: ${f.title}` +
-              (f.requestUrl ? `\n  ${f.requestMethod} ${f.requestUrl}` : '') +
-              (f.requestPayload ? `\n  payload: ${f.requestPayload.slice(0, 120)}` : ''),
-          )
-          .join('\n'),
+          ? `${failed} finding(s) failed · rounds baseline/${rounds.baseline || 0} multi/${rounds['ai-multi'] || 0} fail-level/${rounds['ai-fail-level'] || 0}`
+          : `PASS · ${batch.length} finding(s) · baseline + AI rounds logged`,
+        detail: stepLog.join('\n'),
         screenshotPath: shotPath,
       });
     }
 
     stepIdRef.current = 'vapt-gate';
     updateStep(runId, 'vapt-gate', { status: 'running' });
-    const metrics = summarize(findings, targetUrl, networkCaptures);
+    const metrics = summarize(findings, targetUrl, networkCaptures, aiProbeRounds);
     updateVaptFindings(runId, metrics);
     const failGate = gateFails(findings, gate);
     if (failGate) {
       updateStep(runId, 'vapt-gate', {
         status: 'failed',
         message: `Severity gate (${gate}) triggered`,
-        detail: `${metrics.failed} fail · ${metrics.passed} pass · ${networkCaptures.length} network rows`,
+        detail: `${metrics.failed} fail · ${metrics.passed} pass · ${networkCaptures.length} network · ${aiProbeRounds.length} AI round(s)`,
       });
       skipRemainingSteps(runId, 'Severity gate failed');
       await setRunStatus(
@@ -1357,7 +1573,7 @@ export async function runVapt(
     updateStep(runId, 'vapt-gate', {
       status: 'passed',
       message: `Gate ${gate} clear`,
-      detail: `${metrics.failed} fail · ${metrics.passed} pass · ${networkCaptures.length} network capture(s)`,
+      detail: `${metrics.failed} fail · ${metrics.passed} pass · ${networkCaptures.length} network · ${aiProbeRounds.length} AI round(s) → report`,
     });
     await setRunStatus(runId, 'completed');
   } catch (err) {

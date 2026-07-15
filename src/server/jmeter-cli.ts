@@ -4,6 +4,8 @@ import {
   chmodSync,
   createWriteStream,
   unlinkSync,
+  readdirSync,
+  rmSync,
 } from 'fs';
 import { spawn, spawnSync, type ChildProcess } from 'child_process';
 import path from 'path';
@@ -184,6 +186,14 @@ export function spawnJmeter(opts: {
     '-Jjmeter.save.saveservice.label=true',
     '-Jjmeter.save.saveservice.timestamp=true',
     '-Jjmeter.save.saveservice.time=true',
+    '-Jjmeter.save.saveservice.url=true',
+    '-Jjmeter.save.saveservice.response_message=true',
+    '-Jjmeter.save.saveservice.assertion_results_failure_message=true',
+    '-Jjmeter.save.saveservice.failure_message=true',
+    // Keep response body only on errors — enough for View Results Tree–style debug
+    '-Jjmeter.save.saveservice.response_data=false',
+    '-Jjmeter.save.saveservice.response_data.on_error=true',
+    '-Jjmeter.save.saveservice.samplerData=false',
     ...(opts.logFile ? ['-j', opts.logFile] : []),
     ...(opts.reportDir ? ['-e', '-o', opts.reportDir] : []),
     ...(opts.extraArgs || []),
@@ -236,6 +246,71 @@ export function killJmeterProcess(proc: ChildProcess | undefined) {
       // ignore
     }
   }, 2000);
+}
+
+/**
+ * Generate Apache JMeter HTML Dashboard from an existing JTL (post-run).
+ * Prefer this over `-e -o` during the live run so CLI finishes quickly.
+ */
+export async function generateJmeterHtmlReport(opts: {
+  jmeterBin: string;
+  jtlPath: string;
+  reportDir: string;
+  onLog?: (line: string) => void;
+}): Promise<{ ok: boolean; message: string }> {
+  if (!existsSync(opts.jtlPath)) {
+    return { ok: false, message: `JTL not found: ${opts.jtlPath}` };
+  }
+  mkdirSync(opts.reportDir, { recursive: true });
+  // JMeter refuses non-empty output dirs
+  try {
+    for (const name of readdirSync(opts.reportDir)) {
+      rmSync(path.join(opts.reportDir, name), { recursive: true, force: true });
+    }
+  } catch {
+    // ignore cleanup errors
+  }
+
+  const javaHome = resolveJavaHome();
+  const args = ['-g', opts.jtlPath, '-o', opts.reportDir];
+  opts.onLog?.(`Generating JMeter HTML report: jmeter ${args.join(' ')}`);
+
+  return new Promise((resolve) => {
+    const proc = spawn(opts.jmeterBin, args, {
+      env: {
+        ...process.env,
+        ...(javaHome ? { JAVA_HOME: javaHome, JRE_HOME: javaHome } : {}),
+        JAVA_OPTS: process.env.JAVA_OPTS || '-Xms256m -Xmx1024m',
+      },
+    });
+    let stderr = '';
+    let stdout = '';
+    proc.stdout?.on('data', (buf: Buffer) => {
+      const text = buf.toString('utf8');
+      stdout += text;
+      for (const line of text.split(/\r?\n/).filter(Boolean)) opts.onLog?.(line);
+    });
+    proc.stderr?.on('data', (buf: Buffer) => {
+      const text = buf.toString('utf8');
+      stderr += text;
+      for (const line of text.split(/\r?\n/).filter(Boolean))
+        opts.onLog?.(`[html-report] ${line}`);
+    });
+    proc.on('close', (code) => {
+      const indexPath = path.join(opts.reportDir, 'index.html');
+      if (code === 0 && existsSync(indexPath)) {
+        resolve({ ok: true, message: `HTML report ready at ${opts.reportDir}` });
+        return;
+      }
+      resolve({
+        ok: false,
+        message: `HTML report failed (code ${code}): ${(stderr || stdout).slice(-500)}`,
+      });
+    });
+    proc.on('error', (err) => {
+      resolve({ ok: false, message: err.message });
+    });
+  });
 }
 
 /** @internal test helper — export paths */

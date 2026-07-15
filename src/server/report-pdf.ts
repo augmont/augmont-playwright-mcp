@@ -741,6 +741,317 @@ function writeLoadMetrics(doc: PdfDoc, report: RunReport) {
       doc.moveDown(0.35);
     }
   }
+
+  writeLoadSeriesCharts(doc, m);
+  writeLoadAggregateTable(doc, m);
+  writeLoadHistogram(doc, m);
+}
+
+function writePdfLineChart(
+  doc: PdfDoc,
+  title: string,
+  points: { x: number; y: number }[],
+  color: string,
+) {
+  if (points.length < 2) return;
+  const x0 = left(doc);
+  const w = innerW(doc);
+  const chartH = 72;
+  const padL = 8;
+  const padR = 8;
+  const padT = 18;
+  const padB = 8;
+  ensureSpace(doc, chartH + 28);
+  const top = doc.y;
+  doc.save();
+  doc.roundedRect(x0, top, w, chartH + 6, 6).fillAndStroke(C.panel, C.line);
+  doc.restore();
+  doc.fillColor(C.muted).fontSize(8).text(title, x0 + 10, top + 4, { width: w - 20 });
+
+  const minX = points[0]!.x;
+  const maxX = points[points.length - 1]!.x;
+  const spanX = Math.max(0.1, maxX - minX);
+  const maxY = Math.max(1, ...points.map((p) => p.y)) * 1.1;
+  const plotW = w - padL - padR - 16;
+  const plotH = chartH - padT - padB;
+  const ox = x0 + 8 + padL;
+  const oy = top + padT;
+
+  doc
+    .strokeColor(C.line)
+    .lineWidth(0.5)
+    .moveTo(ox, oy + plotH)
+    .lineTo(ox + plotW, oy + plotH)
+    .stroke();
+
+  doc.strokeColor(color).lineWidth(1.5);
+  points.forEach((p, i) => {
+    const px = ox + ((p.x - minX) / spanX) * plotW;
+    const py = oy + plotH - (Math.max(0, p.y) / maxY) * plotH;
+    if (i === 0) doc.moveTo(px, py);
+    else doc.lineTo(px, py);
+  });
+  doc.stroke();
+  doc.x = x0;
+  doc.y = top + chartH + 14;
+}
+
+function writeLoadSeriesCharts(
+  doc: PdfDoc,
+  m: NonNullable<RunReport['loadMetrics']>,
+) {
+  const series = m.series;
+  if (!series?.length || series.length < 2) return;
+  sectionHeading(doc, 'Over-time graphs (JMeter-style)');
+  writePdfLineChart(
+    doc,
+    'Hits per second (RPS)',
+    series.map((p) => ({ x: p.tSec, y: p.rps })),
+    C.running,
+  );
+  writePdfLineChart(
+    doc,
+    'Avg response time (ms)',
+    series.map((p) => ({ x: p.tSec, y: p.avgMs })),
+    C.accent,
+  );
+  writePdfLineChart(
+    doc,
+    'p95 response time (ms)',
+    series.map((p) => ({ x: p.tSec, y: p.p95Ms })),
+    C.fail,
+  );
+  writePdfLineChart(
+    doc,
+    'Active threads',
+    series.map((p) => ({ x: p.tSec, y: p.activeThreads })),
+    C.brand,
+  );
+  writePdfLineChart(
+    doc,
+    'Error %',
+    series.map((p) => ({ x: p.tSec, y: p.errorPct })),
+    C.fail,
+  );
+  writePdfLineChart(
+    doc,
+    'Transactions OK /s',
+    series.map((p) => ({ x: p.tSec, y: p.successRps || 0 })),
+    C.pass,
+  );
+  writePdfLineChart(
+    doc,
+    'Transactions KO /s',
+    series.map((p) => ({ x: p.tSec, y: p.errorRps || 0 })),
+    C.fail,
+  );
+  if (series.some((p) => p.p90Ms != null)) {
+    writePdfLineChart(
+      doc,
+      'p90 response time (ms)',
+      series.map((p) => ({ x: p.tSec, y: p.p90Ms || 0 })),
+      C.accent,
+    );
+  }
+  if (series.some((p) => p.p99Ms != null)) {
+    writePdfLineChart(
+      doc,
+      'p99 response time (ms)',
+      series.map((p) => ({ x: p.tSec, y: p.p99Ms || 0 })),
+      C.fail,
+    );
+  }
+  if (series.some((p) => p.kbPerSec != null)) {
+    writePdfLineChart(
+      doc,
+      'Received KB/s',
+      series.map((p) => ({ x: p.tSec, y: p.kbPerSec || 0 })),
+      C.running,
+    );
+  }
+  if (series.some((p) => p.kbSentPerSec != null)) {
+    writePdfLineChart(
+      doc,
+      'Sent KB/s',
+      series.map((p) => ({ x: p.tSec, y: p.kbSentPerSec || 0 })),
+      C.brand,
+    );
+  }
+  if (series.some((p) => p.avgTtfbMs != null)) {
+    writePdfLineChart(
+      doc,
+      'Latency / TTFB (ms)',
+      series.map((p) => ({ x: p.tSec, y: p.avgTtfbMs || 0 })),
+      C.accent,
+    );
+  }
+  if (series.some((p) => p.avgConnectMs != null)) {
+    writePdfLineChart(
+      doc,
+      'Connect time (ms)',
+      series.map((p) => ({ x: p.tSec, y: p.avgConnectMs || 0 })),
+      C.pass,
+    );
+  }
+}
+
+function writeLoadAggregateTable(
+  doc: PdfDoc,
+  m: NonNullable<RunReport['loadMetrics']>,
+) {
+  const rows = m.byLabel;
+  if (!rows?.length) return;
+  sectionHeading(doc, 'Aggregate Report (by label)');
+  const x = left(doc);
+  const w = innerW(doc);
+  const headers = ['Label', '#', 'Avg', 'Med', 'p95', 'Err%', 'Thrpt', 'KB/s'];
+  const colW = [
+    w * 0.28,
+    w * 0.07,
+    w * 0.1,
+    w * 0.1,
+    w * 0.1,
+    w * 0.1,
+    w * 0.12,
+    w * 0.13,
+  ];
+
+  ensureSpace(doc, 28);
+  let y = doc.y;
+  doc.fillColor(C.muted).fontSize(7);
+  let cx = x;
+  headers.forEach((h, i) => {
+    doc.text(h, cx, y, { width: colW[i], lineBreak: false });
+    cx += colW[i]!;
+  });
+  y += 12;
+  doc
+    .strokeColor(C.line)
+    .lineWidth(0.5)
+    .moveTo(x, y)
+    .lineTo(x + w, y)
+    .stroke();
+  y += 4;
+
+  for (const r of rows.slice(0, 40)) {
+    ensureSpace(doc, 14);
+    y = doc.y;
+    const vals = [
+      r.label.slice(0, 36),
+      String(r.samples),
+      String(r.avgMs),
+      String(r.medianMs ?? r.p50Ms),
+      String(r.p95Ms),
+      String(r.errorPct),
+      String(r.throughput),
+      String(r.kbPerSec),
+    ];
+    doc.fillColor(C.text).fontSize(7.5);
+    cx = x;
+    vals.forEach((v, i) => {
+      doc.text(v, cx, y, { width: colW[i]! - 2, lineBreak: false });
+      cx += colW[i]!;
+    });
+    doc.y = y + 11;
+  }
+  doc.moveDown(0.4);
+
+  sectionHeading(doc, 'Summary Report');
+  const sumHeaders = ['Label', '#', 'Avg', 'Min', 'Max', 'StdDev', 'Err%', 'KB'];
+  const sumColW = [
+    w * 0.28,
+    w * 0.08,
+    w * 0.1,
+    w * 0.1,
+    w * 0.1,
+    w * 0.12,
+    w * 0.1,
+    w * 0.12,
+  ];
+  ensureSpace(doc, 28);
+  y = doc.y;
+  doc.fillColor(C.muted).fontSize(7);
+  cx = x;
+  sumHeaders.forEach((h, i) => {
+    doc.text(h, cx, y, { width: sumColW[i], lineBreak: false });
+    cx += sumColW[i]!;
+  });
+  y += 12;
+  doc
+    .strokeColor(C.line)
+    .lineWidth(0.5)
+    .moveTo(x, y)
+    .lineTo(x + w, y)
+    .stroke();
+  y += 4;
+  for (const r of rows.slice(0, 40)) {
+    ensureSpace(doc, 14);
+    y = doc.y;
+    const vals = [
+      r.label.slice(0, 36),
+      String(r.samples),
+      String(r.avgMs),
+      String(r.minMs),
+      String(r.maxMs),
+      String(r.stddevMs ?? '—'),
+      String(r.errorPct),
+      String(r.receivedKB ?? '—'),
+    ];
+    doc.fillColor(C.text).fontSize(7.5);
+    cx = x;
+    vals.forEach((v, i) => {
+      doc.text(v, cx, y, { width: sumColW[i]! - 2, lineBreak: false });
+      cx += sumColW[i]!;
+    });
+    doc.y = y + 11;
+  }
+  doc.moveDown(0.4);
+}
+
+function writeLoadHistogram(
+  doc: PdfDoc,
+  m: NonNullable<RunReport['loadMetrics']>,
+) {
+  const buckets = m.latencyHistogram;
+  if (!buckets?.length) return;
+  const total = buckets.reduce((a, b) => a + b.count, 0);
+  if (!total) return;
+  sectionHeading(doc, 'Response time distribution');
+  const x = left(doc);
+  const w = innerW(doc);
+  const max = Math.max(1, ...buckets.map((b) => b.count));
+  const barH = 56;
+  ensureSpace(doc, barH + 36);
+  const top = doc.y;
+  const n = buckets.length;
+  const gap = 4;
+  const barW = Math.max(8, (w - gap * (n - 1)) / n);
+  buckets.forEach((b, i) => {
+    const h = Math.max(2, (b.count / max) * barH);
+    const bx = x + i * (barW + gap);
+    const by = top + barH - h;
+    doc.save();
+    doc.roundedRect(bx, by, barW, h, 2).fill(C.running);
+    doc.restore();
+    doc
+      .fillColor(C.muted)
+      .fontSize(6)
+      .text(String(b.count), bx, top + barH + 2, {
+        width: barW,
+        align: 'center',
+        lineBreak: false,
+      });
+    doc
+      .fillColor(C.muted)
+      .fontSize(5.5)
+      .text(b.bucketLabel, bx - 2, top + barH + 12, {
+        width: barW + 4,
+        align: 'center',
+        lineBreak: false,
+      });
+  });
+  doc.x = x;
+  doc.y = top + barH + 28;
 }
 
 function writeLoadAuth(doc: PdfDoc, report: RunReport) {
@@ -814,6 +1125,7 @@ function writeVaptFindings(doc: PdfDoc, report: RunReport) {
     ['Checked / Passed / Failed', `${m.checked} / ${m.passed} / ${m.failed}`],
     ['Info / Errors', `${m.info} / ${m.errors}`],
     ['Network captures', String(m.networkCaptures?.length || 0)],
+    ['AI probe rounds', String(m.aiProbeRounds?.length || 0)],
     [
       'By severity',
       ['critical', 'high', 'medium', 'low', 'info']
@@ -863,11 +1175,17 @@ function writeVaptFindings(doc: PdfDoc, report: RunReport) {
       doc.fillColor(C.text).fontSize(10).text(f.title, { continued: true });
       doc
         .fillColor(statusColor)
-        .text(`  [${f.checkId || 'check'} · ${f.severity} · ${f.status}]`);
+        .text(
+          `  [${f.checkId || 'check'} · ${f.probeRound || 'baseline'} · ${f.severity} · ${f.status}]`,
+        );
       doc
         .fillColor(C.muted)
         .fontSize(8)
-        .text([f.category, f.owasp, f.cwe].filter(Boolean).join(' · ') || '—');
+        .text(
+          [f.category, f.owasp, f.cwe, f.aiModel ? `AI:${f.aiModel}` : '', f.aiQueryLabel]
+            .filter(Boolean)
+            .join(' · ') || '—',
+        );
       if (f.requestUrl) {
         doc
           .fillColor(C.text)
@@ -901,6 +1219,38 @@ function writeVaptFindings(doc: PdfDoc, report: RunReport) {
           .text(`Remediation: ${f.recommendation.slice(0, 400)}`, { width: w });
       }
       doc.moveDown(0.3);
+    }
+  }
+
+  const aiRounds = m.aiProbeRounds || [];
+  if (aiRounds.length) {
+    sectionHeading(doc, 'Runtime AI query rounds');
+    for (const r of aiRounds) {
+      ensureSpace(doc, 36);
+      const roundColor =
+        r.status === 'error' ? C.fail : r.status === 'skipped' ? C.muted : C.pass;
+      doc
+        .fillColor(C.text)
+        .fontSize(9)
+        .text(`${r.checkId} · ${r.level}`, { continued: true });
+      doc.fillColor(roundColor).text(`  [${r.status}]`);
+      doc
+        .fillColor(C.muted)
+        .fontSize(8)
+        .text(
+          [
+            r.model ? `model=${r.model}` : null,
+            `queries=${r.queryCount}`,
+            `pass=${r.passed}`,
+            `fail=${r.failed}`,
+            `err=${r.errors}`,
+            r.detail,
+          ]
+            .filter(Boolean)
+            .join(' · '),
+          { width: w },
+        );
+      doc.moveDown(0.2);
     }
   }
 

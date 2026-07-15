@@ -377,6 +377,9 @@ export interface VaptNetworkCapture {
   source: 'probe' | 'browser';
 }
 
+/** Which probe round produced a finding (baseline catalogue vs runtime AI). */
+export type VaptProbeRound = 'baseline' | 'ai-multi' | 'ai-fail-level';
+
 export interface VaptFinding {
   id: string;
   title: string;
@@ -396,6 +399,26 @@ export interface VaptFinding {
   responseStatus?: number;
   responseSnippet?: string;
   screenshotPath?: string;
+  /** baseline catalogue, AI multi-query, or AI fail-level escalation */
+  probeRound?: VaptProbeRound;
+  /** Short label for the AI-generated query variant */
+  aiQueryLabel?: string;
+  /** Model that authored the query (when AI-generated) */
+  aiModel?: string;
+}
+
+/** One runtime AI query generation + execution round for a check. */
+export interface VaptAiProbeRoundSummary {
+  checkId: string;
+  level: 'multi' | 'fail-level';
+  status: 'ok' | 'skipped' | 'error';
+  model?: string;
+  queryCount: number;
+  passed: number;
+  failed: number;
+  errors: number;
+  detail?: string;
+  at: string;
 }
 
 export interface VaptLiveMetrics {
@@ -409,6 +432,81 @@ export interface VaptLiveMetrics {
   networkCaptures?: VaptNetworkCapture[];
   targetUrl?: string;
   engine?: 'http-probe' | 'api-vapt';
+  /** Runtime AI multi-query + fail-level escalation rounds */
+  aiProbeRounds?: VaptAiProbeRoundSummary[];
+}
+
+/** One point on live / report time-series charts (~1s buckets). */
+export interface LoadSeriesPoint {
+  /** Seconds since run start */
+  tSec: number;
+  /** Hits / requests completed in this bucket (JMeter “Hits per second”) */
+  rps: number;
+  /** Successful transactions per second in this bucket */
+  successRps?: number;
+  /** Failed transactions per second in this bucket */
+  errorRps?: number;
+  avgMs: number;
+  /** Median (p50) for this bucket */
+  medianMs?: number;
+  p90Ms?: number;
+  p95Ms: number;
+  p99Ms?: number;
+  activeThreads: number;
+  errorPct: number;
+  successCount: number;
+  errorCount: number;
+  /** Network throughput received in this bucket (KB/s) */
+  kbPerSec?: number;
+  /** Network throughput sent in this bucket (KB/s) */
+  kbSentPerSec?: number;
+  /** Avg Latency / TTFB (ms) in this bucket */
+  avgTtfbMs?: number;
+  /** Avg Connect time (ms) in this bucket */
+  avgConnectMs?: number;
+  /** Cumulative samples from run start through this bucket */
+  cumulativeSamples?: number;
+  /** Cumulative errors from run start through this bucket */
+  cumulativeErrors?: number;
+  /** 2xx / 4xx / 5xx / other counts in this bucket */
+  status2xx?: number;
+  status4xx?: number;
+  status5xx?: number;
+  statusOther?: number;
+}
+
+/** JMeter Aggregate / Summary Report row (per sampler label). */
+export interface LoadLabelAggregate {
+  label: string;
+  samples: number;
+  avgMs: number;
+  minMs: number;
+  maxMs: number;
+  /** Median = p50 (JMeter Summary Report “Median”) */
+  medianMs?: number;
+  /** Std. Dev. (JMeter Summary Report) */
+  stddevMs?: number;
+  p50Ms: number;
+  p90Ms: number;
+  p95Ms: number;
+  p99Ms: number;
+  errorPct: number;
+  /** Requests / sec for this label over wall clock */
+  throughput: number;
+  kbPerSec: number;
+  /** Sent KB/s for this label */
+  sentKbPerSec?: number;
+  /** Average response size in bytes */
+  avgBytes?: number;
+  /** Total received KB for this label */
+  receivedKB?: number;
+  /** Total sent KB for this label */
+  sentKB?: number;
+}
+
+export interface LoadLatencyHistogramBucket {
+  bucketLabel: string;
+  count: number;
 }
 
 /** Live / final HTTP load metrics shown on the run page. */
@@ -442,6 +540,8 @@ export interface WebLoadLiveMetrics {
   jmxPath?: string;
   /** HTML report folder if generated */
   reportDir?: string;
+  /** True when JMeter HTML dashboard index.html is ready to open */
+  htmlReportReady?: boolean;
   /** Recent JMeter / runner log lines for the detail panel */
   logLines?: string[];
   /** Bytes received / sec when known */
@@ -468,6 +568,12 @@ export interface WebLoadLiveMetrics {
   windowAvgMs?: number;
   /** Window size used for rpsLive / windowAvgMs (sec) */
   windowSec?: number;
+  /** Time-series for live / report graphs */
+  series?: LoadSeriesPoint[];
+  /** Aggregate Report by sampler label */
+  byLabel?: LoadLabelAggregate[];
+  /** Response-time distribution */
+  latencyHistogram?: LoadLatencyHistogramBucket[];
   /** Recent failed samples with request/response error detail */
   recentErrors?: Array<{
     at?: string;
