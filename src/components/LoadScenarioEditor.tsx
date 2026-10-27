@@ -52,6 +52,12 @@ import {
   applyApiMappingsToStep,
   listJsonExtracts,
 } from '@/lib/load-chain';
+import {
+  parseImportJson,
+  detectImportFormat,
+  type ImportFormat,
+  type ImportResult,
+} from '@/lib/parse-import';
 
 const METHODS: WebLoadHttpMethod[] = [
   'GET',
@@ -795,6 +801,14 @@ export function LoadScenarioEditor({
   const [curlError, setCurlError] = useState('');
   const [curlMode, setCurlMode] = useState<'replace' | 'add'>('replace');
   const [curlImportedMsg, setCurlImportedMsg] = useState('');
+  const [importSource, setImportSource] = useState<'curl' | 'file'>('curl');
+  const [importJsonText, setImportJsonText] = useState('');
+  const [importResult, setImportResult] = useState<ImportResult | null>(null);
+  const [importError, setImportError] = useState('');
+  const [importMsg, setImportMsg] = useState('');
+  const [importDragOver, setImportDragOver] = useState(false);
+  const [importDetectedFormat, setImportDetectedFormat] = useState<ImportFormat>('unknown');
+  const [importSelectedSteps, setImportSelectedSteps] = useState<Set<number>>(new Set());
   const [exportFormat, setExportFormat] =
     useState<RequestExportFormat>('curl');
   const [exportCopied, setExportCopied] = useState(false);
@@ -806,6 +820,8 @@ export function LoadScenarioEditor({
   const [forceSend, setForceSend] = useState(false);
   const [dynamicMsg, setDynamicMsg] = useState('');
   const [extractPreview, setExtractPreview] = useState<string | null>(null);
+  const [scenarioDragIdx, setScenarioDragIdx] = useState<number | null>(null);
+  const [scenarioDragOver, setScenarioDragOver] = useState<number | null>(null);
 
   const safeIdx = Math.min(activeIdx, Math.max(0, requests.length - 1));
   const active = requests[safeIdx];
@@ -1267,7 +1283,49 @@ export function LoadScenarioEditor({
           </div>
           <ul className="scenario-list">
             {requests.map((r, i) => (
-              <li key={`${i}-${r.path}`}>
+              <li
+                key={`${i}-${r.path}`}
+                draggable
+                className={`scenario-list-li ${scenarioDragIdx === i ? 'scenario-dragging' : ''} ${scenarioDragOver === i ? 'scenario-drag-over' : ''}`}
+                onDragStart={(e) => {
+                  setScenarioDragIdx(i);
+                  e.dataTransfer.effectAllowed = 'move';
+                  e.dataTransfer.setData('text/plain', String(i));
+                  e.dataTransfer.setData('application/x-scenario', JSON.stringify({
+                    type: 'scenario-drag',
+                    index: i,
+                    method: r.method,
+                    path: r.path,
+                    extractJsons: r.extractJsons,
+                  }));
+                }}
+                onDragEnd={() => {
+                  setScenarioDragIdx(null);
+                  setScenarioDragOver(null);
+                }}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = 'move';
+                  if (scenarioDragIdx != null && scenarioDragIdx !== i) {
+                    setScenarioDragOver(i);
+                  }
+                }}
+                onDragLeave={() => setScenarioDragOver(null)}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  const fromStr = e.dataTransfer.getData('text/plain');
+                  const from = fromStr !== '' ? Number(fromStr) : scenarioDragIdx;
+                  if (from != null && !Number.isNaN(from) && from !== i && from >= 0 && from < requests.length) {
+                    const next = [...requests];
+                    const [item] = next.splice(from, 1);
+                    next.splice(i, 0, item);
+                    onChange(next);
+                    setActiveIdx(i);
+                  }
+                  setScenarioDragIdx(null);
+                  setScenarioDragOver(null);
+                }}
+              >
                 <button
                   type="button"
                   className={`scenario-list-item ${i === safeIdx ? 'active' : ''}`}
@@ -1279,6 +1337,7 @@ export function LoadScenarioEditor({
                     setDynamicMsg('');
                   }}
                 >
+                  <span className="scenario-list-grip">⠿</span>
                   <span
                     className={`swagger-method method-${(r.method || 'get').toLowerCase()}`}
                   >
@@ -1380,6 +1439,137 @@ export function LoadScenarioEditor({
             Use main API URL as base
           </label>
 
+          {/* ── API Model Info Bar ── */}
+          {(active.apiDefinition || active.bodyRequired?.length || paramDefs.some(p => p.required) || (probe?.response)) ? (
+            <div className="model-info-bar">
+              {/* Request model */}
+              <div className="model-info-card">
+                <div className="model-info-card-head">
+                  <span className="model-info-icon">📥</span>
+                  <strong>Request Model</strong>
+                </div>
+                <div className="model-info-card-body">
+                  {paramDefs.filter(p => p.in === 'path').length > 0 && (
+                    <div className="model-info-row">
+                      <span className="model-info-label">Path params</span>
+                      <div className="model-info-chips">
+                        {paramDefs.filter(p => p.in === 'path').map(p => (
+                          <span key={p.name} className={`model-info-chip ${p.required ? 'required' : ''}`}>
+                            :{p.name}
+                            {p.type ? <em>{p.type}</em> : null}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {paramDefs.filter(p => p.in === 'query').length > 0 && (
+                    <div className="model-info-row">
+                      <span className="model-info-label">Query params</span>
+                      <div className="model-info-chips">
+                        {paramDefs.filter(p => p.in === 'query').map(p => (
+                          <span key={p.name} className={`model-info-chip ${p.required ? 'required' : ''}`}>
+                            {p.name}
+                            {p.type ? <em>{p.type}</em> : null}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {paramDefs.filter(p => p.in === 'header').length > 0 && (
+                    <div className="model-info-row">
+                      <span className="model-info-label">Headers</span>
+                      <div className="model-info-chips">
+                        {paramDefs.filter(p => p.in === 'header').map(p => (
+                          <span key={p.name} className={`model-info-chip ${p.required ? 'required' : ''}`}>
+                            {p.name}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {active.bodyRequired?.length ? (
+                    <div className="model-info-row">
+                      <span className="model-info-label">Required body fields</span>
+                      <div className="model-info-chips">
+                        {active.bodyRequired.map(f => (
+                          <span key={f} className="model-info-chip required">{f}</span>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                  {active.apiDefinition?.requestContentType ? (
+                    <div className="model-info-row">
+                      <span className="model-info-label">Content-Type</span>
+                      <code className="model-info-ct">{active.apiDefinition.requestContentType}</code>
+                    </div>
+                  ) : null}
+                  {active.apiDefinition?.requestSchemaPreview ? (
+                    <details className="model-info-schema">
+                      <summary>Request schema</summary>
+                      <pre className="model-info-pre">{active.apiDefinition.requestSchemaPreview}</pre>
+                    </details>
+                  ) : null}
+                  {active.apiDefinition?.requestExample ? (
+                    <details className="model-info-schema">
+                      <summary>Request example</summary>
+                      <pre className="model-info-pre">{active.apiDefinition.requestExample}</pre>
+                    </details>
+                  ) : null}
+                  {!paramDefs.length && !active.bodyRequired?.length && !active.apiDefinition?.requestSchemaPreview && !active.apiDefinition?.requestExample ? (
+                    <p className="model-info-empty">No request model info. Import from Swagger to populate.</p>
+                  ) : null}
+                </div>
+              </div>
+
+              {/* Response model */}
+              <div className="model-info-card">
+                <div className="model-info-card-head">
+                  <span className="model-info-icon">📤</span>
+                  <strong>Response Model</strong>
+                </div>
+                <div className="model-info-card-body">
+                  {active.apiDefinition?.responses?.length ? (
+                    <div className="model-info-responses">
+                      {active.apiDefinition.responses.map(r => (
+                        <div key={r.status} className="model-info-resp-item">
+                          <span className={`model-info-status model-info-status-${String(r.status).startsWith('2') ? 'ok' : String(r.status).startsWith('3') ? 'warn' : 'err'}`}>
+                            {r.status}
+                          </span>
+                          {r.description ? <span className="model-info-resp-desc">{r.description}</span> : null}
+                          {r.contentType ? <code className="model-info-ct">{r.contentType}</code> : null}
+                          {r.schemaPreview ? (
+                            <details className="model-info-schema">
+                              <summary>Schema</summary>
+                              <pre className="model-info-pre">{r.schemaPreview}</pre>
+                            </details>
+                          ) : null}
+                          {r.example ? (
+                            <details className="model-info-schema">
+                              <summary>Example</summary>
+                              <pre className="model-info-pre">{r.example}</pre>
+                            </details>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                  {probe?.response ? (
+                    <div className="model-info-row">
+                      <span className="model-info-label">Last response</span>
+                      <span className={`model-info-status model-info-status-${probe.response.status >= 200 && probe.response.status < 300 ? 'ok' : probe.response.status >= 300 && probe.response.status < 400 ? 'warn' : 'err'}`}>
+                        {probe.response.status} {probe.response.statusText}
+                      </span>
+                      <span className="model-info-meta">{probe.elapsedMs}ms</span>
+                    </div>
+                  ) : null}
+                  {!active.apiDefinition?.responses?.length && !probe?.response ? (
+                    <p className="model-info-empty">No response model info. Import from Swagger or Send to capture.</p>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+          ) : null}
+
           <div className="scenario-tabs" role="tablist">
             {(
               [
@@ -1389,7 +1579,7 @@ export function LoadScenarioEditor({
                 ['chain', 'Chain'],
                 ['docs', 'Docs'],
                 ['timing', 'Timing'],
-                ['curl', 'Import curl'],
+                ['curl', 'Import'],
                 ['export', 'Code'],
                 ['result', 'Request / Response'],
               ] as const
@@ -2063,6 +2253,12 @@ export function LoadScenarioEditor({
               extractPreview={extractPreview}
               onPatch={patchActive}
               onInsertToken={insertDynamicToken}
+              allScenarios={requests}
+              onPatchScenario={(idx, patch) => {
+                const next = [...requests];
+                next[idx] = { ...next[idx], ...patch };
+                onChange(next);
+              }}
             />
           ) : null}
 
@@ -2100,7 +2296,27 @@ export function LoadScenarioEditor({
           ) : null}
 
           {tab === 'curl' ? (
-            <div className="scenario-tab-panel curl-import-panel">
+            <div className="scenario-tab-panel import-panel">
+              {/* Import source tabs */}
+              <div className="import-source-tabs">
+                <button
+                  type="button"
+                  className={`import-source-tab ${importSource === 'curl' ? 'active' : ''}`}
+                  onClick={() => setImportSource('curl')}
+                >
+                  <span className="import-source-icon">⌘</span>
+                  <span>cURL</span>
+                </button>
+                <button
+                  type="button"
+                  className={`import-source-tab ${importSource === 'file' ? 'active' : ''}`}
+                  onClick={() => setImportSource('file')}
+                >
+                  <span className="import-source-icon">📦</span>
+                  <span>Swagger / Postman / JSON</span>
+                </button>
+              </div>
+              {importSource === 'curl' ? (<>
               <p className="history-meta">
                 Paste a curl command to fill this scenario’s method, URL, Params,
                 Headers, and Body (raw / form-data / urlencoded) — same fields used
@@ -2150,6 +2366,263 @@ export function LoadScenarioEditor({
                 <p className="step-msg">{curlImportedMsg}</p>
               ) : null}
               {curlError ? <p className="error-text">{curlError}</p> : null}
+              </>) : null}
+
+              {/* ── Swagger / Postman / HAR / JSON import ── */}
+              {importSource === 'file' ? (
+                <div className="import-file-panel">
+                  <div className="import-format-badges">
+                    <span className="import-format-badge">OpenAPI 3.x</span>
+                    <span className="import-format-badge">Swagger 2.0</span>
+                    <span className="import-format-badge">Postman v2.1</span>
+                    <span className="import-format-badge">HAR</span>
+                    <span className="import-format-badge">JSON</span>
+                  </div>
+
+                  <div
+                    className={`import-drop-zone ${importDragOver ? 'drag-over' : ''}`}
+                    onDragOver={(e) => {
+                      e.preventDefault();
+                      e.dataTransfer.dropEffect = 'copy';
+                      setImportDragOver(true);
+                    }}
+                    onDragLeave={() => setImportDragOver(false)}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      setImportDragOver(false);
+                      const file = e.dataTransfer.files?.[0];
+                      if (file) {
+                        const reader = new FileReader();
+                        reader.onload = () => {
+                          const text = String(reader.result || '');
+                          setImportJsonText(text);
+                          setImportDetectedFormat(detectImportFormat(text));
+                          setImportError('');
+                          setImportResult(null);
+                          setImportMsg('');
+                        };
+                        reader.readAsText(file);
+                      }
+                    }}
+                  >
+                    <div className="import-drop-icon">📂</div>
+                    <p className="import-drop-text">Drag &amp; drop a file here, or</p>
+                    <label className="btn btn-ghost btn-sm import-file-btn">
+                      Browse file
+                      <input
+                        type="file"
+                        accept=".json,.yaml,.yml,.har"
+                        style={{ display: 'none' }}
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          const reader = new FileReader();
+                          reader.onload = () => {
+                            const text = String(reader.result || '');
+                            setImportJsonText(text);
+                            setImportDetectedFormat(detectImportFormat(text));
+                            setImportError('');
+                            setImportResult(null);
+                            setImportMsg('');
+                          };
+                          reader.readAsText(file);
+                          e.target.value = '';
+                        }}
+                      />
+                    </label>
+                  </div>
+
+                  <p className="history-meta" style={{ marginTop: '0.5rem' }}>
+                    Supported files: OpenAPI / Swagger JSON, Postman Collection v2.1 JSON, HAR (.har), or raw JSON arrays of requests.
+                    If drag &amp; drop doesn’t work, use <strong>Browse file</strong>.
+                  </p>
+
+                  <p className="history-meta" style={{ margin: '0.5rem 0 0.25rem' }}>
+                    Or paste JSON directly:
+                  </p>
+                  <textarea
+                    rows={8}
+                    className="scenario-body-input"
+                    placeholder="Paste Swagger / OpenAPI / Postman Collection / HAR JSON here..."
+                    value={importJsonText}
+                    onChange={(e) => {
+                      setImportJsonText(e.target.value);
+                      setImportDetectedFormat(detectImportFormat(e.target.value));
+                      setImportError('');
+                      setImportResult(null);
+                      setImportMsg('');
+                    }}
+                  />
+
+                  {importDetectedFormat !== 'unknown' && !importResult ? (
+                    <p className="import-detected-badge">
+                      Detected: <strong>{
+                        importDetectedFormat === 'swagger' ? 'OpenAPI / Swagger' :
+                        importDetectedFormat === 'postman' ? 'Postman Collection' :
+                        importDetectedFormat === 'har' ? 'HAR (HTTP Archive)' :
+                        'JSON requests'
+                      }</strong>
+                    </p>
+                  ) : null}
+
+                  <div className="import-file-actions">
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      disabled={!importJsonText.trim()}
+                      onClick={() => {
+                        setImportError('');
+                        setImportMsg('');
+                        setImportResult(null);
+                        try {
+                          const result = parseImportJson(importJsonText, {
+                            apiBaseUrl: effectiveApiBase,
+                          });
+                          setImportResult(result);
+                          setImportSelectedSteps(new Set(result.steps.map((_, i) => i)));
+                        } catch (err) {
+                          setImportError(err instanceof Error ? err.message : 'Import failed');
+                        }
+                      }}
+                    >
+                      Parse &amp; Preview
+                    </button>
+                    {importResult ? (
+                      <button
+                        type="button"
+                        className="btn btn-ghost"
+                        onClick={() => {
+                          setImportResult(null);
+                          setImportJsonText('');
+                          setImportMsg('');
+                          setImportDetectedFormat('unknown');
+                        }}
+                      >
+                        Clear
+                      </button>
+                    ) : null}
+                  </div>
+
+                  {importError ? <p className="error-text">{importError}</p> : null}
+
+                  {importResult ? (
+                    <div className="import-result-panel">
+                      <div className="import-result-header">
+                        <h4>{importResult.label}</h4>
+                        {importResult.apiBaseUrl ? (
+                          <p className="history-meta">
+                            Base URL: <code>{importResult.apiBaseUrl}</code>
+                          </p>
+                        ) : null}
+                      </div>
+
+                      {importResult.warnings.length > 0 ? (
+                        <div className="import-warnings">
+                          {importResult.warnings.map((w, i) => (
+                            <p key={i} className="import-warning-item">⚠ {w}</p>
+                          ))}
+                        </div>
+                      ) : null}
+
+                      {importResult.steps.length > 0 ? (
+                        <>
+                          <div className="import-select-bar">
+                            <label className="swagger-check">
+                              <input
+                                type="checkbox"
+                                checked={importSelectedSteps.size === importResult.steps.length}
+                                onChange={(e) => {
+                                  if (e.target.checked) {
+                                    setImportSelectedSteps(new Set(importResult!.steps.map((_, i) => i)));
+                                  } else {
+                                    setImportSelectedSteps(new Set());
+                                  }
+                                }}
+                              />
+                              Select all ({importResult.steps.length})
+                            </label>
+                            <span className="history-meta">
+                              {importSelectedSteps.size} selected
+                            </span>
+                          </div>
+
+                          <div className="import-step-list">
+                            {importResult.steps.map((step, i) => (
+                              <label
+                                key={`${step.method}-${step.path}-${i}`}
+                                className={`import-step-item ${importSelectedSteps.has(i) ? 'selected' : ''}`}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={importSelectedSteps.has(i)}
+                                  onChange={(e) => {
+                                    const next = new Set(importSelectedSteps);
+                                    if (e.target.checked) next.add(i);
+                                    else next.delete(i);
+                                    setImportSelectedSteps(next);
+                                  }}
+                                />
+                                <span className={`swagger-method method-${(step.method || 'get').toLowerCase()}`}>
+                                  {step.method || 'GET'}
+                                </span>
+                                <span className="import-step-info">
+                                  <strong>{step.name || step.path}</strong>
+                                  <code>{step.path}</code>
+                                </span>
+                                {step.body ? <span className="import-step-badge">body</span> : null}
+                              </label>
+                            ))}
+                          </div>
+
+                          <div className="import-apply-bar">
+                            <div className="swagger-docs-auth-modes">
+                              <button
+                                type="button"
+                                className={`creds-role-tab ${curlMode === 'replace' ? 'active' : ''}`}
+                                onClick={() => setCurlMode('replace')}
+                              >
+                                Replace all scenarios
+                              </button>
+                              <button
+                                type="button"
+                                className={`creds-role-tab ${curlMode === 'add' ? 'active' : ''}`}
+                                onClick={() => setCurlMode('add')}
+                              >
+                                Append to existing
+                              </button>
+                            </div>
+                            <button
+                              type="button"
+                              className="btn btn-primary"
+                              disabled={importSelectedSteps.size === 0}
+                              onClick={() => {
+                                const selected = importResult!.steps.filter((_, i) => importSelectedSteps.has(i));
+                                if (!selected.length) return;
+                                if (curlMode === 'replace') {
+                                  onChange(selected);
+                                  setActiveIdx(0);
+                                } else {
+                                  onChange([...requests, ...selected]);
+                                  setActiveIdx(requests.length);
+                                }
+                                setTab('headers');
+                                setProbe(null);
+                                setImportMsg(`Imported ${selected.length} scenario${selected.length > 1 ? 's' : ''} from ${importResult!.format}`);
+                                setImportResult(null);
+                                setImportJsonText('');
+                              }}
+                            >
+                              Import {importSelectedSteps.size} scenario{importSelectedSteps.size !== 1 ? 's' : ''}
+                            </button>
+                          </div>
+                        </>
+                      ) : null}
+                    </div>
+                  ) : null}
+
+                  {importMsg ? <p className="step-msg">{importMsg}</p> : null}
+                </div>
+              ) : null}
             </div>
           ) : null}
 

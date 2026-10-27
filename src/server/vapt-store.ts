@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import path from 'path';
 import type {
   TestCaseMeta,
+  VaptCaseIntent,
   VaptCheckId,
   VaptConfig,
   VaptSeverity,
@@ -9,10 +10,11 @@ import type {
   WebLoadHttpMethod,
 } from '@/lib/types';
 import { VAPT_CATALOGUE_ATTACKS } from '@/lib/vapt-attacks';
+import { normalizeVaptProfile } from '@/lib/vapt-profile';
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const STORE_PATH = path.join(DATA_DIR, 'vapt-cases.json');
-const SEED_VERSION = 6;
+const SEED_VERSION = 7;
 
 const METHODS: WebLoadHttpMethod[] = [
   'GET',
@@ -88,6 +90,14 @@ function normalizeStartUrl(raw: unknown): string {
   return s.startsWith('/') ? s : `/${s}`;
 }
 
+function normalizeIntent(raw: unknown): VaptCaseIntent {
+  const s = String(raw || '')
+    .trim()
+    .toLowerCase();
+  if (s === 'fail' || s === 'negative' || s === 'failure') return 'fail';
+  return 'pass';
+}
+
 function normalizeVapt(raw: Partial<VaptConfig> | undefined): VaptConfig | null {
   if (!raw || typeof raw !== 'object') return null;
   const targetUrl = (raw.targetUrl || '').toString().trim();
@@ -115,17 +125,26 @@ function normalizeVapt(raw: Partial<VaptConfig> | undefined): VaptConfig | null 
     startUrl: normalizeStartUrl(raw.startUrl),
     checks: normalizeChecks(raw.checks),
     severityGate,
+    intent: normalizeIntent(raw.intent),
+    profile: normalizeVaptProfile(raw.profile),
   };
 }
 
 function buildSeed(): VaptTestCase[] {
   const total = VAPT_CATALOGUE_ATTACKS.length;
+  const hygieneCore: VaptCheckId[] = [
+    'security-headers',
+    'cookie-flags',
+    'tls-url',
+    'api-auth-bypass',
+    'api-error-hygiene',
+  ];
   return [
     {
       id: 'vapt-login-main-suite',
-      name: 'Login — main VAPT suite',
-      description: `Main test case starts on /login, then runs ${total} internal attack scenarios (Brute Force, DDoS posture, SQLi, XSS, CSRF, RCE, Command Injection, Directory Traversal, File Upload, Auth Bypass, Privilege Escalation, Session Hijacking, MITM/TLS, SSRF, XXE, Deserialization, API Abuse, Malware upload surface, Phishing surface, Zero-Day posture). Safe hygiene probes only — no exploit payloads.`,
-      tags: ['vapt', 'login', 'main', 'suite', 'catalogue'],
+      name: 'Login — main VAPT suite (Higher · Pass)',
+      description: `Main pass-case starts on /login, then runs ${total} internal attack scenarios at Higher depth (baseline → AI multi → fail-level on pass). Safe hygiene probes only — no exploit payloads.`,
+      tags: ['vapt', 'login', 'main', 'suite', 'catalogue', 'pass', 'higher'],
       estimatedMinutes: 8,
       kind: 'vapt',
       source: 'seed',
@@ -140,6 +159,32 @@ function buildSeed(): VaptTestCase[] {
         body: '{"key":"country"}',
         checks: [...VAPT_CATALOGUE_ATTACKS],
         severityGate: 'high',
+        intent: 'pass',
+        profile: 'higher',
+      },
+    },
+    {
+      id: 'vapt-login-fail-hygiene',
+      name: 'Login — fail-case hygiene suite (Advanced)',
+      description:
+        'Fail-case oriented suite: probes auth bypass, error hygiene, headers, and cookie flags at Advanced depth (baseline + AI multi) to surface control gaps.',
+      tags: ['vapt', 'login', 'fail', 'advanced', 'hygiene'],
+      estimatedMinutes: 4,
+      kind: 'vapt',
+      source: 'seed',
+      group: 'login-fail',
+      suiteMode: 'single',
+      vapt: {
+        startUrl: '/login',
+        targetUrl: '/location',
+        method: 'POST',
+        useApiBase: true,
+        headers: { 'Content-Type': 'application/json' },
+        body: '{"key":"country"}',
+        checks: hygieneCore,
+        severityGate: 'medium',
+        intent: 'fail',
+        profile: 'advanced',
       },
     },
   ];
@@ -171,17 +216,34 @@ function normalizeCase(input: unknown): VaptTestCase | null {
   if (!id.startsWith('vapt-')) id = `vapt-${id}`;
   const vapt = normalizeVapt(raw.vapt);
   if (!vapt) return null;
+  const source =
+    raw.source === 'upload' ||
+    raw.source === 'claude' ||
+    raw.source === 'manual' ||
+    raw.source === 'seed'
+      ? raw.source
+      : 'seed';
+  const intent = vapt.intent || 'pass';
+  const profile = vapt.profile || 'higher';
+  let tags = Array.isArray(raw.tags) ? raw.tags.map(String) : ['vapt'];
+  if (!tags.includes('vapt')) tags = ['vapt', ...tags];
+  if (!tags.includes(intent)) tags = [...tags, intent];
+  if (!tags.includes(profile)) tags = [...tags, profile];
+
   return {
     id,
     name,
     description: (raw.description || name).toString(),
-    tags: Array.isArray(raw.tags) ? raw.tags.map(String) : ['vapt'],
+    tags,
     estimatedMinutes: clampInt(raw.estimatedMinutes, 1, 1, 120),
     kind: 'vapt',
-    source: raw.source === 'upload' || raw.source === 'claude' ? raw.source : 'seed',
+    source,
     group: raw.group != null ? String(raw.group) : undefined,
-    suiteMode: raw.suiteMode === 'combined' || raw.suiteMode === 'single' ? raw.suiteMode : undefined,
-    vapt,
+    suiteMode:
+      raw.suiteMode === 'combined' || raw.suiteMode === 'single'
+        ? raw.suiteMode
+        : undefined,
+    vapt: { ...vapt, intent, profile },
   };
 }
 
@@ -257,9 +319,11 @@ export function upsertVaptCase(input: unknown): VaptTestCase | null {
   return normalized;
 }
 
+export type VaptCaseSource = 'claude' | 'upload' | 'seed' | 'manual';
+
 export function normalizeVaptCases(
   input: unknown,
-  source: 'claude' | 'upload' | 'seed' = 'claude',
+  source: VaptCaseSource = 'claude',
 ): VaptTestCase[] {
   const root = input && typeof input === 'object' ? (input as Record<string, unknown>) : {};
   const list = Array.isArray(input)
@@ -279,7 +343,7 @@ export function normalizeVaptCases(
 
 export function upsertVaptCases(
   cases: VaptTestCase[],
-  source: 'claude' | 'upload' = 'claude',
+  source: VaptCaseSource = 'claude',
 ): { added: string[]; replaced: string[]; cases: VaptTestCase[] } {
   const current = listVaptCases();
   const byId = new Map(current.map((c) => [c.id, c]));

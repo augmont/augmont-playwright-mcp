@@ -257,6 +257,8 @@ export function VaptMcpDiscoverModal({
           provider,
           stream: false,
           visitedPaths: paths,
+          intent: 'both',
+          profile: 'higher',
           ...aiKeysForRun(),
         }),
       });

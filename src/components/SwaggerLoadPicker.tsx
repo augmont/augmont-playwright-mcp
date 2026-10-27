@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   emptyLoadCredential,
@@ -13,13 +13,33 @@ import {
   writePresetAuthHeaders,
 } from '@/lib/load-auth-credentials';
 import { useAppStore } from '@/lib/store';
-import type { LoadAuthCredential, SwaggerOperation, WebLoadTestCase } from '@/lib/types';
+import type { LoadAuthCredential, SwaggerOperation, WebLoadTestCase, WebLoadRequestStep } from '@/lib/types';
 import { ModalCloseButton } from '@/components/ModalCloseButton';
 import { LoadAuthFileImport } from '@/components/LoadAuthFileImport';
 import {
   paramDefsFromPathAndSwagger,
   seedParamValues,
 } from '@/lib/load-request-params';
+import { parseImportJson } from '@/lib/parse-import';
+
+type ImportSourceTab =
+  | 'swagger'
+  | 'postman-file'
+  | 'postman-link'
+  | 'har'
+  | 'curl'
+  | 'website'
+  | 'raw-json';
+
+const IMPORT_TABS: { id: ImportSourceTab; label: string; icon: string; desc: string }[] = [
+  { id: 'swagger', label: 'Swagger / OpenAPI', icon: '📘', desc: 'Fetch from live URL' },
+  { id: 'postman-file', label: 'Postman Collection', icon: '📦', desc: 'Upload JSON file' },
+  { id: 'postman-link', label: 'Postman Link', icon: '🔗', desc: 'Share link or API URL' },
+  { id: 'har', label: 'HAR File', icon: '🌐', desc: 'Browser network export' },
+  { id: 'curl', label: 'cURL', icon: '⌨️', desc: 'Paste cURL command' },
+  { id: 'website', label: 'Website Crawl', icon: '🕷️', desc: 'Discover APIs from live page' },
+  { id: 'raw-json', label: 'Raw JSON', icon: '{ }', desc: 'Paste scenario JSON' },
+];
 
 type SwaggerFetchResult = {
   title: string;
@@ -84,6 +104,19 @@ export function SwaggerLoadPicker({ baseUrl, apiUrl, onSaved }: Props) {
   ]);
   const [directToken, setDirectToken] = useState('');
   const [authMode, setAuthMode] = useState<'login' | 'token'>('login');
+
+  // ─── Multi-source import state ───
+  const [importTab, setImportTab] = useState<ImportSourceTab>('swagger');
+  const [importText, setImportText] = useState('');
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [importSteps, setImportSteps] = useState<WebLoadRequestStep[]>([]);
+  const [importLabel, setImportLabel] = useState('');
+  const [importWarnings, setImportWarnings] = useState<string[]>([]);
+  const [importBusy, setImportBusy] = useState(false);
+  const [postmanLinkUrl, setPostmanLinkUrl] = useState('');
+  const [curlText, setCurlText] = useState('');
+  const [websiteUrl, setWebsiteUrl] = useState('');
+  const importFileRef = useRef<HTMLInputElement>(null);
 
   const selectedOps = useMemo(() => {
     if (!spec) return [];
@@ -332,6 +365,200 @@ export function SwaggerLoadPicker({ baseUrl, apiUrl, onSaved }: Props) {
     }
   }
 
+  // ─── Multi-source import handlers ───
+
+  async function handleFileImport(file: File) {
+    setImportBusy(true);
+    setError('');
+    setImportSteps([]);
+    setImportWarnings([]);
+    try {
+      const text = await file.text();
+      const result = parseImportJson(text, { apiBaseUrl: apiUrl });
+      setImportSteps(result.steps);
+      setImportLabel(result.label);
+      setImportWarnings(result.warnings);
+      if (result.apiBaseUrl && !apiUrl) setApiUrl(result.apiBaseUrl);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to parse file');
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  async function handleTextImport(text: string) {
+    setImportBusy(true);
+    setError('');
+    setImportSteps([]);
+    setImportWarnings([]);
+    try {
+      const result = parseImportJson(text, { apiBaseUrl: apiUrl });
+      setImportSteps(result.steps);
+      setImportLabel(result.label);
+      setImportWarnings(result.warnings);
+      if (result.apiBaseUrl && !apiUrl) setApiUrl(result.apiBaseUrl);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to parse');
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  function parseCurlToStep(curl: string): WebLoadRequestStep | null {
+    const trimmed = curl.trim().replace(/\\\n/g, ' ').replace(/\\\r\n/g, ' ');
+    const urlMatch = trimmed.match(/curl\s+(?:--[a-z-]+\s+)*['"]?(https?:\/\/[^\s'"]+)['"]?/i)
+      || trimmed.match(/['"]?(https?:\/\/[^\s'"]+)['"]?/);
+    if (!urlMatch) return null;
+    const url = urlMatch[1];
+    const headers: Record<string, string> = {};
+    const hMatches = [...trimmed.matchAll(/-H\s+['"]([^'"]+)['"]/gi)];
+    for (const m of hMatches) {
+      const [key, ...rest] = m[1].split(':');
+      if (key && rest.length) headers[key.trim()] = rest.join(':').trim();
+    }
+    let method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' = 'GET';
+    const mMatch = trimmed.match(/-X\s+(\w+)/i);
+    if (mMatch) method = mMatch[1].toUpperCase() as typeof method;
+    let body: string | undefined;
+    const bMatch = trimmed.match(/(?:-d|--data|--data-raw|--data-binary)\s+['"](.+?)['"]/s);
+    if (bMatch) {
+      body = bMatch[1];
+      if (!mMatch) method = 'POST';
+    }
+    const parsed = new URL(url);
+    return {
+      name: `${method} ${parsed.pathname}`,
+      path: parsed.pathname + parsed.search,
+      method,
+      headers: Object.keys(headers).length ? headers : undefined,
+      body: body || undefined,
+      useApiBase: false,
+    };
+  }
+
+  async function handleCurlImport() {
+    setImportBusy(true);
+    setError('');
+    setImportSteps([]);
+    try {
+      const lines = curlText.split(/\n(?=curl\s)/i).filter(Boolean);
+      const steps: WebLoadRequestStep[] = [];
+      for (const line of lines) {
+        const step = parseCurlToStep(line);
+        if (step) steps.push(step);
+      }
+      if (!steps.length) throw new Error('Could not parse any cURL commands. Ensure valid cURL format.');
+      setImportSteps(steps);
+      setImportLabel(`cURL import (${steps.length} request${steps.length > 1 ? 's' : ''})`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'cURL parse failed');
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  async function handlePostmanLink() {
+    setImportBusy(true);
+    setError('');
+    setImportSteps([]);
+    try {
+      let url = postmanLinkUrl.trim();
+      if (url.includes('postman.com') && !url.includes('/collection/')) {
+        throw new Error('Enter a Postman Collection share link (e.g. https://www.postman.com/collections/...)');
+      }
+      if (url.includes('postman.com') && url.includes('/collection/')) {
+        const idMatch = url.match(/\/collection\/([a-zA-Z0-9-]+)/);
+        if (idMatch) url = `https://www.postman.com/collections/${idMatch[1]}`;
+      }
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Failed to fetch Postman collection (${res.status})`);
+      const text = await res.text();
+      const result = parseImportJson(text, { apiBaseUrl: apiUrl });
+      setImportSteps(result.steps);
+      setImportLabel(result.label);
+      setImportWarnings(result.warnings);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to fetch Postman link');
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  async function handleWebsiteCrawl() {
+    setImportBusy(true);
+    setError('');
+    setImportSteps([]);
+    try {
+      const url = websiteUrl.trim();
+      if (!url) throw new Error('Enter a website URL');
+      const res = await fetch('/api/tests/load/crawl', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error((data as { error?: string }).error || `Crawl failed (${res.status})`);
+      }
+      const data = await res.json();
+      const steps = (data as { steps?: WebLoadRequestStep[] }).steps || [];
+      if (!steps.length) throw new Error('No API endpoints discovered on this page. Try a page with API calls.');
+      setImportSteps(steps);
+      setImportLabel(`Website crawl (${steps.length} API${steps.length > 1 ? 's' : ''})`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Crawl failed');
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  async function saveImportedSteps() {
+    if (!importSteps.length) return;
+    setSaving(true);
+    setError('');
+    try {
+      const label = importLabel || `Imported (${importSteps.length} scenarios)`;
+      const first = importSteps[0];
+      const cases: WebLoadTestCase[] = [{
+        id: `import-${Date.now()}`,
+        name: label.slice(0, 120),
+        description: `Imported ${importSteps.length} API scenario(s) via ${importTab}.`,
+        tags: ['web-load', 'import', importTab],
+        estimatedMinutes: Math.max(2, Math.ceil(importSteps.length / 20)),
+        kind: 'web-load',
+        source: 'upload',
+        load: {
+          targetUrl: first.path,
+          method: first.method,
+          useApiBase: first.useApiBase ?? true,
+          headers: first.headers || { Accept: 'application/json' },
+          body: first.body,
+          virtualUsers: AUTO_VUS,
+          durationSec: AUTO_DURATION_SEC,
+          rampUpSec: AUTO_RAMP_SEC,
+          maxErrorRatePct: 10,
+          p95Ms: 4000,
+          p99Ms: 6000,
+          profile: importSteps.length > 1 ? 'advanced' : 'basic',
+          requests: importSteps.length > 1 ? importSteps : undefined,
+        },
+      }];
+      const res = await fetch('/api/tests/load/cases', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cases, source: 'upload' }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error((data as { error?: string }).error || 'Failed to save cases');
+      onSaved();
+      setOpen(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save');
+    } finally {
+      setSaving(false);
+    }
+  }
+
   function buildCases(): WebLoadTestCase[] {
     if (!spec || !selectedOps.length) return [];
 
@@ -475,10 +702,9 @@ export function SwaggerLoadPicker({ baseUrl, apiUrl, onSaved }: Props) {
             <div className="report-modal swagger-picker-modal">
               <header className="creds-modal-header">
                 <div className="creds-modal-header-copy">
-                  <h2>Swagger → API load tests</h2>
+                  <h2>Import API Scenarios</h2>
                   <p className="history-meta">
-                    Pick APIs — they become <strong>internal scenarios</strong> inside one main{' '}
-                    <strong>Swagger</strong> load case (auto{' '}
+                    Import from multiple sources — APIs become <strong>internal scenarios</strong> inside a load case (auto{' '}
                     <strong>
                       {AUTO_VUS} VUs · {AUTO_DURATION_SEC}s
                     </strong>
@@ -494,7 +720,32 @@ export function SwaggerLoadPicker({ baseUrl, apiUrl, onSaved }: Props) {
                 <ModalCloseButton onClick={closePicker} />
               </header>
 
+              {/* ─── Import Source Tabs ─── */}
+              <div className="import-source-tabs-bar">
+                {IMPORT_TABS.map((t) => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    className={`import-source-tab ${importTab === t.id ? 'active' : ''}`}
+                    onClick={() => {
+                      setImportTab(t.id);
+                      setError('');
+                      setImportSteps([]);
+                      setImportWarnings([]);
+                    }}
+                    title={t.desc}
+                  >
+                    <span className="import-source-tab-icon">{t.icon}</span>
+                    <span className="import-source-tab-label">{t.label}</span>
+                  </button>
+                ))}
+              </div>
+
               <div className="report-modal-body swagger-picker-body">
+
+                {/* ─── TAB: Swagger / OpenAPI ─── */}
+                {importTab === 'swagger' && (
+                  <>
                 <div className="swagger-url-row">
                   <label htmlFor="swaggerUrlInput">
                     Swagger / OpenAPI JSON URL
@@ -873,29 +1124,285 @@ export function SwaggerLoadPicker({ baseUrl, apiUrl, onSaved }: Props) {
                   </>
                 ) : null}
 
+                {/* Swagger actions */}
+                {importTab === 'swagger' && (
+                  <div className="creds-actions">
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      disabled={saving || !selectedOps.length || (needsAuth && !authReady)}
+                      onClick={() => void saveCases()}
+                    >
+                      {saving
+                        ? 'Saving…'
+                        : selectedOps.length
+                          ? `Import ${selectedOps.length} scenario${selectedOps.length === 1 ? '' : 's'}`
+                          : 'Import scenarios'}
+                    </button>
+                    <button type="button" className="btn btn-ghost" onClick={closePicker}>
+                      Cancel
+                    </button>
+                  </div>
+                )}
+                  </>
+                )}
+
+                {/* ─── TAB: Postman Collection File ─── */}
+                {importTab === 'postman-file' && (
+                  <div className="import-tab-content">
+                    <h3 className="import-tab-title">📦 Upload Postman Collection</h3>
+                    <p className="history-meta">Upload a Postman Collection v2.0 / v2.1 JSON file exported from Postman.</p>
+                    <div
+                      className="import-file-drop-zone"
+                      onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        const file = e.dataTransfer.files[0];
+                        if (file) { setImportFile(file); void handleFileImport(file); }
+                      }}
+                      onClick={() => importFileRef.current?.click()}
+                    >
+                      <input
+                        ref={importFileRef}
+                        type="file"
+                        accept=".json,.har"
+                        hidden
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (file) { setImportFile(file); void handleFileImport(file); }
+                        }}
+                      />
+                      <span className="import-file-drop-icon">📁</span>
+                      <span className="import-file-drop-text">
+                        {importFile ? importFile.name : 'Drop Postman JSON or click to choose'}
+                      </span>
+                      <span className="import-file-drop-hint">.json</span>
+                    </div>
+                  </div>
+                )}
+
+                {/* ─── TAB: Postman Link ─── */}
+                {importTab === 'postman-link' && (
+                  <div className="import-tab-content">
+                    <h3 className="import-tab-title">🔗 Postman Share Link</h3>
+                    <p className="history-meta">Paste a Postman collection share URL or public API link.</p>
+                    <div className="swagger-url-row">
+                      <label htmlFor="postmanLinkInput">
+                        Postman Collection URL
+                        <input
+                          id="postmanLinkInput"
+                          className="url-input"
+                          type="url"
+                          placeholder="https://www.postman.com/collections/abc123..."
+                          value={postmanLinkUrl}
+                          onChange={(e) => setPostmanLinkUrl(e.target.value)}
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        className="btn btn-primary"
+                        disabled={importBusy || !postmanLinkUrl.trim()}
+                        onClick={() => void handlePostmanLink()}
+                      >
+                        {importBusy ? 'Fetching…' : 'Fetch Collection'}
+                      </button>
+                    </div>
+                    <p className="history-meta" style={{ marginTop: '0.5rem' }}>
+                      Supports: Postman share links, public workspace URLs, raw JSON URLs
+                    </p>
+                  </div>
+                )}
+
+                {/* ─── TAB: HAR File ─── */}
+                {importTab === 'har' && (
+                  <div className="import-tab-content">
+                    <h3 className="import-tab-title">🌐 HAR File Import</h3>
+                    <p className="history-meta">
+                      Upload a HAR (HTTP Archive) file exported from browser DevTools (Network → Export HAR).
+                    </p>
+                    <div
+                      className="import-file-drop-zone"
+                      onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        const file = e.dataTransfer.files[0];
+                        if (file) { setImportFile(file); void handleFileImport(file); }
+                      }}
+                      onClick={() => importFileRef.current?.click()}
+                    >
+                      <input
+                        ref={importFileRef}
+                        type="file"
+                        accept=".har,.json"
+                        hidden
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (file) { setImportFile(file); void handleFileImport(file); }
+                        }}
+                      />
+                      <span className="import-file-drop-icon">📁</span>
+                      <span className="import-file-drop-text">
+                        {importFile ? importFile.name : 'Drop HAR file or click to choose'}
+                      </span>
+                      <span className="import-file-drop-hint">.har · .json</span>
+                    </div>
+                    <div className="import-har-help">
+                      <strong>How to export HAR:</strong> Chrome DevTools → Network tab → right-click → "Save all as HAR"
+                    </div>
+                  </div>
+                )}
+
+                {/* ─── TAB: cURL ─── */}
+                {importTab === 'curl' && (
+                  <div className="import-tab-content">
+                    <h3 className="import-tab-title">⌨️ cURL Import</h3>
+                    <p className="history-meta">
+                      Paste one or more cURL commands. Supports multiple commands separated by newlines.
+                    </p>
+                    <textarea
+                      className="import-curl-textarea"
+                      rows={8}
+                      placeholder={`curl -X POST 'https://api.example.com/users' \\\n  -H 'Content-Type: application/json' \\\n  -d '{"name": "test"}'`}
+                      value={curlText}
+                      onChange={(e) => setCurlText(e.target.value)}
+                    />
+                    <div className="import-tab-actions">
+                      <button
+                        type="button"
+                        className="btn btn-primary"
+                        disabled={importBusy || !curlText.trim()}
+                        onClick={() => void handleCurlImport()}
+                      >
+                        {importBusy ? 'Parsing…' : 'Parse cURL'}
+                      </button>
+                      <span className="history-meta">
+                        Tip: right-click request in DevTools → "Copy as cURL"
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {/* ─── TAB: Website Crawl ─── */}
+                {importTab === 'website' && (
+                  <div className="import-tab-content">
+                    <h3 className="import-tab-title">🕷️ Website API Crawler</h3>
+                    <p className="history-meta">
+                      Enter a live website URL — we'll analyze the page and discover API endpoints from its network calls, scripts, and HTML.
+                    </p>
+                    <div className="swagger-url-row">
+                      <label htmlFor="websiteUrlInput">
+                        Website URL
+                        <input
+                          id="websiteUrlInput"
+                          className="url-input"
+                          type="url"
+                          placeholder="https://example.com/dashboard"
+                          value={websiteUrl}
+                          onChange={(e) => setWebsiteUrl(e.target.value)}
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        className="btn btn-primary"
+                        disabled={importBusy || !websiteUrl.trim()}
+                        onClick={() => void handleWebsiteCrawl()}
+                      >
+                        {importBusy ? 'Crawling…' : 'Discover APIs'}
+                      </button>
+                    </div>
+                    <p className="history-meta" style={{ marginTop: '0.5rem' }}>
+                      Works best on SPAs and pages that make XHR/fetch calls. Detects REST endpoints, GraphQL, and form submissions.
+                    </p>
+                  </div>
+                )}
+
+                {/* ─── TAB: Raw JSON ─── */}
+                {importTab === 'raw-json' && (
+                  <div className="import-tab-content">
+                    <h3 className="import-tab-title">{'{ }'} Raw JSON Import</h3>
+                    <p className="history-meta">
+                      Paste raw JSON — supports Swagger/OpenAPI spec, Postman Collection, HAR, or a plain array of scenario objects.
+                    </p>
+                    <textarea
+                      className="import-curl-textarea"
+                      rows={10}
+                      placeholder='Paste Swagger spec, Postman collection, HAR, or JSON array...'
+                      value={importText}
+                      onChange={(e) => setImportText(e.target.value)}
+                    />
+                    <div className="import-tab-actions">
+                      <button
+                        type="button"
+                        className="btn btn-primary"
+                        disabled={importBusy || !importText.trim()}
+                        onClick={() => void handleTextImport(importText)}
+                      >
+                        {importBusy ? 'Parsing…' : 'Parse & Import'}
+                      </button>
+                      <span className="history-meta">Auto-detects format</span>
+                    </div>
+                  </div>
+                )}
+
+                {/* ─── Imported Steps Preview (non-swagger tabs) ─── */}
+                {importTab !== 'swagger' && importSteps.length > 0 && (
+                  <div className="import-steps-preview">
+                    <p className="step-msg">
+                      <strong>{importLabel}</strong> · {importSteps.length} scenario{importSteps.length > 1 ? 's' : ''} detected
+                    </p>
+                    {importWarnings.length > 0 && (
+                      <div className="import-warnings">
+                        {importWarnings.map((w, i) => (
+                          <p key={i} className="import-warning-item">⚠️ {w}</p>
+                        ))}
+                      </div>
+                    )}
+                    <ul className="swagger-op-list">
+                      {importSteps.map((step, i) => (
+                        <li key={i}>
+                          <div className="swagger-op-row selected">
+                            <span className={`swagger-method method-${step.method.toLowerCase()}`}>
+                              {step.method}
+                            </span>
+                            <span className="swagger-path">
+                              <code>{step.path}</code>
+                              {step.name && step.name !== `${step.method} ${step.path}` ? (
+                                <span className="swagger-summary">{step.name}</span>
+                              ) : null}
+                            </span>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {/* ─── Non-swagger save ─── */}
+                {importTab !== 'swagger' && (
+                  <div className="creds-actions">
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      disabled={saving || !importSteps.length}
+                      onClick={() => void saveImportedSteps()}
+                    >
+                      {saving
+                        ? 'Saving…'
+                        : importSteps.length
+                          ? `Import ${importSteps.length} scenario${importSteps.length > 1 ? 's' : ''}`
+                          : 'Import scenarios'}
+                    </button>
+                    <button type="button" className="btn btn-ghost" onClick={closePicker}>
+                      Cancel
+                    </button>
+                  </div>
+                )}
+
                 {error ? (
                   <p className="error-text" style={{ whiteSpace: 'pre-wrap' }}>
                     {error}
                   </p>
                 ) : null}
-
-                <div className="creds-actions">
-                  <button
-                    type="button"
-                    className="btn btn-primary"
-                    disabled={saving || !selectedOps.length || (needsAuth && !authReady)}
-                    onClick={() => void saveCases()}
-                  >
-                    {saving
-                      ? 'Saving…'
-                      : selectedOps.length
-                        ? `Create Swagger case (${selectedOps.length} scenario${selectedOps.length === 1 ? '' : 's'})`
-                        : 'Create Swagger case'}
-                  </button>
-                  <button type="button" className="btn btn-ghost" onClick={closePicker}>
-                    Cancel
-                  </button>
-                </div>
               </div>
             </div>
           </div>,
@@ -906,7 +1413,7 @@ export function SwaggerLoadPicker({ baseUrl, apiUrl, onSaved }: Props) {
   return (
     <>
       <button type="button" className="btn btn-primary" onClick={openPicker}>
-        Import from Swagger
+        Import APIs
       </button>
       {modal}
     </>

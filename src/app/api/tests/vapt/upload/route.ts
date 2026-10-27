@@ -32,6 +32,8 @@ export async function POST(request: Request) {
   const aiKeys = sanitizeClientAiKeys({ openRouterApiKey, anthropicApiKey });
   const stream = String(form.get('stream') || 'true') !== 'false';
   const extraPrompt = String(form.get('prompt') || '').trim();
+  const intent = String(form.get('intent') || 'pass').trim() || 'pass';
+  const profile = String(form.get('profile') || 'higher').trim() || 'higher';
 
   if (!(file instanceof File)) {
     return Response.json({ error: 'file is required' }, { status: 400 });
@@ -101,6 +103,8 @@ export async function POST(request: Request) {
         openRouterApiKey: aiKeys.openRouterApiKey,
         anthropicApiKey: aiKeys.anthropicApiKey,
         fileContent: content.slice(0, 60_000),
+        intent,
+        profile,
         onProgress: (event: VaptAiProgressEvent) => {
           send({ ...event });
         },

@@ -16,6 +16,7 @@ import type {
   VaptTestCase,
 } from '@/lib/types';
 import { countAttacks } from '@/lib/vapt-attacks';
+import { vaptProfileHint, vaptProfileLabel } from '@/lib/vapt-profile';
 import { aiKeysForRun } from '@/lib/ai-keys';
 
 function formatWhen(iso?: string) {
@@ -462,6 +463,18 @@ export function VaptTestWorkspace({
           <p className="hero-sub">
             {meta ? (
               <>
+                <span
+                  className={`tag expectation-tag expectation-${meta.vapt.intent === 'fail' ? 'negative' : 'positive'}`}
+                >
+                  {meta.vapt.intent === 'fail' ? 'Fail case' : 'Pass case'}
+                </span>{' '}
+                <span
+                  className={`tag vapt-profile-tag vapt-profile-${meta.vapt.profile || 'higher'}`}
+                  title={vaptProfileHint(meta.vapt.profile)}
+                >
+                  {vaptProfileLabel(meta.vapt.profile)}
+                </span>
+                {' · '}
                 <strong>{attackTotal}</strong> internal scenario
                 {attackTotal === 1 ? '' : 's'} · MCP{' '}
                 <code>{meta.vapt.startUrl || '/login'}</code>
@@ -475,6 +488,8 @@ export function VaptTestWorkspace({
                     · ~{meta.estimatedMinutes} min
                   </>
                 ) : null}
+                <br />
+                <span className="field-hint">{vaptProfileHint(meta.vapt.profile)}</span>
               </>
             ) : (
               'Login main suite — attacks as internal scenarios'

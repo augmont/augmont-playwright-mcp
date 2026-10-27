@@ -7,6 +7,7 @@ import { isVaptReady, useAppStore } from '@/lib/store';
 import { useStoreHydrated } from '@/lib/use-store-hydrated';
 import type { VaptTestCase } from '@/lib/types';
 import { countAttacks, vaptAttackLabel } from '@/lib/vapt-attacks';
+import { vaptProfileHint, vaptProfileLabel } from '@/lib/vapt-profile';
 import { VaptAiPanel } from '@/components/VaptAiPanel';
 
 export default function VaptTestsPage() {
@@ -92,8 +93,9 @@ export default function VaptTestsPage() {
         <div className="flow-header-copy">
           <h1 className="hero-title">Login VAPT</h1>
           <p className="hero-sub flow-header-sub">
-            Main case starts on <strong>/login</strong>. Attack types run as{' '}
-            <strong>internal scenarios</strong> (safe posture probes). Portal{' '}
+            Create <strong>Pass</strong> / <strong>Fail</strong> cases at{' '}
+            <strong>Basic</strong>, <strong>Advanced</strong>, or <strong>Higher</strong> depth —
+            AI generate, manual entry, or upload. Starts on <strong>/login</strong>. Portal{' '}
             <strong style={{ color: 'var(--accent)' }}>{baseUrl}</strong>
             {apiUrl ? (
               <>
@@ -123,16 +125,34 @@ export default function VaptTestsPage() {
       <div className="load-case-grid">
         {cases.map((c) => {
           const n = countAttacks(c.vapt.checks);
+          const intent = c.vapt.intent === 'fail' ? 'fail' : 'pass';
+          const profile = c.vapt.profile || 'higher';
           return (
             <article key={c.id} className="choice-card load-case-card vapt-main-case-card">
               <span className="choice-card-eyebrow">
-                Main · login entry · {n} internal scenario{n === 1 ? '' : 's'} · gate{' '}
-                {c.vapt.severityGate || 'high'}
-                {c.source === 'claude' ? ' · AI' : ''}
+                <span
+                  className={`tag expectation-tag expectation-${intent === 'fail' ? 'negative' : 'positive'}`}
+                >
+                  {intent === 'fail' ? 'Fail case' : 'Pass case'}
+                </span>{' '}
+                <span className={`tag vapt-profile-tag vapt-profile-${profile}`}>
+                  {vaptProfileLabel(profile)}
+                </span>
+                {' · '}
+                {n} scenario{n === 1 ? '' : 's'} · gate {c.vapt.severityGate || 'high'}
+                {c.source === 'claude'
+                  ? ' · AI'
+                  : c.source === 'manual'
+                    ? ' · Manual'
+                    : c.source === 'upload'
+                      ? ' · Upload'
+                      : ''}
               </span>
               <h2>{c.name}</h2>
               <p>{c.description}</p>
               <p className="load-case-meta">
+                {vaptProfileHint(profile)}
+                {' · '}
                 Start: <code>{c.vapt.startUrl || '/login'}</code>
                 {' · '}
                 API target: <code>{c.vapt.targetUrl}</code>

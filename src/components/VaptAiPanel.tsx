@@ -18,14 +18,17 @@ import {
   activeProviderHasKey,
   aiKeysForRun,
 } from '@/lib/ai-keys';
-import type { VaptTestCase } from '@/lib/types';
+import type { VaptCaseIntent, VaptProfile, VaptTestCase } from '@/lib/types';
+import { vaptProfileHint } from '@/lib/vapt-profile';
 import { ModalCloseButton } from '@/components/ModalCloseButton';
 import { VaptMcpDiscoverModal } from '@/components/VaptMcpDiscoverModal';
+import { VaptManualCaseModal } from '@/components/VaptManualCaseModal';
 
 const OR_STORAGE = 'lgd-openrouter-model';
 const CLAUDE_STORAGE = 'lgd-claude-model';
 
 type ActionModal = 'generate' | 'upload' | null;
+type IntentMode = VaptCaseIntent | 'both';
 
 type Props = {
   baseUrl: string;
@@ -45,6 +48,9 @@ export function VaptAiPanel({ baseUrl, apiUrl, onSaved }: Props) {
 
   const [actionModal, setActionModal] = useState<ActionModal>(null);
   const [mcpOpen, setMcpOpen] = useState(false);
+  const [manualOpen, setManualOpen] = useState(false);
+  const [intentMode, setIntentMode] = useState<IntentMode>('both');
+  const [profile, setProfile] = useState<VaptProfile>('higher');
   const [prompt, setPrompt] = useState('');
   const [model, setModel] = useState(OPENROUTER_AUTO);
   const [orModels, setOrModels] = useState<OpenRouterModelOption[]>(OPENROUTER_MODELS);
@@ -186,6 +192,8 @@ export function VaptAiPanel({ baseUrl, apiUrl, onSaved }: Props) {
           model,
           provider: aiProvider,
           stream: true,
+          intent: intentMode,
+          profile,
           ...aiKeysForRun(),
         }),
       });
@@ -214,7 +222,8 @@ export function VaptAiPanel({ baseUrl, apiUrl, onSaved }: Props) {
       if (!cases.length) throw new Error(doneMessage || 'No VAPT cases returned');
       openPreview(
         cases,
-        doneMessage || `Generated ${cases.length} scenario(s). Select and save.`,
+        doneMessage ||
+          `Generated ${cases.length} scenario(s) (${intentMode} · ${profile}). Select and save.`,
       );
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Generate failed');
@@ -324,11 +333,10 @@ export function VaptAiPanel({ baseUrl, apiUrl, onSaved }: Props) {
   const busy = generating || uploading || saving;
 
   const modelSelect = (
-    <label className="field" style={{ margin: 0, minWidth: '10rem' }}>
-      <span className="field-hint" style={{ marginBottom: '0.2rem' }}>
-        Model
-      </span>
+    <label className="ai-model-select-field">
+      <span className="ai-model-select-label">Model</span>
       <select
+        className="ai-model-select"
         value={model}
         onChange={(e) => onModelChange(e.target.value)}
         disabled={busy || !canUseAi}
@@ -379,6 +387,15 @@ export function VaptAiPanel({ baseUrl, apiUrl, onSaved }: Props) {
                         <strong>{c.name}</strong>
                         <br />
                         <span className="field-hint">
+                          <span
+                            className={`tag expectation-tag expectation-${c.vapt.intent === 'fail' ? 'negative' : 'positive'}`}
+                          >
+                            {c.vapt.intent === 'fail' ? 'Fail' : 'Pass'}
+                          </span>{' '}
+                          <span className={`tag vapt-profile-tag vapt-profile-${c.vapt.profile || 'higher'}`}>
+                            {c.vapt.profile || 'higher'}
+                          </span>
+                          {' · '}
                           {c.vapt.method || 'GET'} {c.vapt.targetUrl}
                           {c.vapt.useApiBase ? ' (API)' : ''} · start{' '}
                           {c.vapt.startUrl || '/login'} · gate{' '}
@@ -424,6 +441,18 @@ export function VaptAiPanel({ baseUrl, apiUrl, onSaved }: Props) {
           }}
         >
           AI Generate
+        </button>
+        <button
+          type="button"
+          className="btn btn-ghost"
+          disabled={busy}
+          onClick={() => {
+            setError('');
+            setMessage('');
+            setManualOpen(true);
+          }}
+        >
+          Manual entry
         </button>
         <button
           type="button"
@@ -503,14 +532,79 @@ export function VaptAiPanel({ baseUrl, apiUrl, onSaved }: Props) {
               {actionModal === 'generate' ? (
                 <form className="ai-card ai-composer" onSubmit={onGenerate}>
                   <p className="field-hint">
-                    Describe VAPT probe scenarios (path, checks like security-headers / cookie-flags).
-                    Example: “Probe /login for cookie flags and security headers”.
+                    Describe VAPT probe scenarios. Choose <strong>Pass</strong>,{' '}
+                    <strong>Fail</strong>, or <strong>Both</strong>, plus probe level{' '}
+                    <strong>Basic / Advanced / Higher</strong>.
                   </p>
+
+                  <div className="vapt-manual-row" style={{ marginBottom: '0.75rem' }}>
+                    <div className="field" style={{ margin: 0 }}>
+                      <span className="field-hint">AI case type</span>
+                      <div
+                        className="expectation-tabs"
+                        role="tablist"
+                        aria-label="Pass or fail generation"
+                      >
+                        {(
+                          [
+                            { id: 'pass', label: 'Pass case' },
+                            { id: 'fail', label: 'Fail case' },
+                            { id: 'both', label: 'Pass + Fail' },
+                          ] as const
+                        ).map((tab) => (
+                          <button
+                            key={tab.id}
+                            type="button"
+                            role="tab"
+                            aria-selected={intentMode === tab.id}
+                            className={`mode-btn ${intentMode === tab.id ? 'active' : ''}`}
+                            disabled={generating}
+                            onClick={() => setIntentMode(tab.id)}
+                          >
+                            {tab.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="field" style={{ margin: 0 }}>
+                      <span className="field-hint">Probe level</span>
+                      <div
+                        className="expectation-tabs"
+                        role="tablist"
+                        aria-label="VAPT profile"
+                      >
+                        {(
+                          [
+                            { id: 'basic', label: 'Basic' },
+                            { id: 'advanced', label: 'Advanced' },
+                            { id: 'higher', label: 'Higher' },
+                          ] as const
+                        ).map((tab) => (
+                          <button
+                            key={tab.id}
+                            type="button"
+                            role="tab"
+                            aria-selected={profile === tab.id}
+                            className={`mode-btn ${profile === tab.id ? 'active' : ''}`}
+                            disabled={generating}
+                            onClick={() => setProfile(tab.id)}
+                            title={vaptProfileHint(tab.id)}
+                          >
+                            {tab.label}
+                          </button>
+                        ))}
+                      </div>
+                      <p className="field-hint" style={{ marginTop: '0.35rem' }}>
+                        {vaptProfileHint(profile)}
+                      </p>
+                    </div>
+                  </div>
+
                   <div className="ai-composer-box">
                     <textarea
                       className="ai-textarea ai-composer-input"
                       rows={4}
-                      placeholder="e.g. Unauth /admin access check and Location API CORS probe…"
+                      placeholder="e.g. Login + Location API: pass suite for clean posture and fail suite for auth/header gaps…"
                       value={prompt}
                       onChange={(e) => setPrompt(e.target.value)}
                       disabled={generating}
@@ -522,7 +616,13 @@ export function VaptAiPanel({ baseUrl, apiUrl, onSaved }: Props) {
                         className="btn btn-primary ai-composer-go"
                         disabled={generating || !canUseAi}
                       >
-                        {generating ? 'Generating…' : 'Generate'}
+                        {generating
+                          ? 'Generating…'
+                          : intentMode === 'both'
+                            ? 'Generate Pass + Fail'
+                            : intentMode === 'fail'
+                              ? 'Generate Fail case'
+                              : 'Generate Pass case'}
                       </button>
                     </div>
                   </div>
@@ -625,6 +725,15 @@ export function VaptAiPanel({ baseUrl, apiUrl, onSaved }: Props) {
             msg ||
               `Generated ${cases.length} scenario(s) from MCP${usedModel ? ` via ${usedModel}` : ''}.`,
           );
+        }}
+      />
+
+      <VaptManualCaseModal
+        open={manualOpen}
+        onClose={() => setManualOpen(false)}
+        onSaved={() => {
+          setMessage('Manual VAPT case saved.');
+          onSaved();
         }}
       />
     </>

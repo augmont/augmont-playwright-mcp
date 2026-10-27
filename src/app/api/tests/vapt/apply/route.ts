@@ -13,7 +13,14 @@ export async function POST(request: Request) {
     source?: string;
   };
 
-  const source = body.source === 'upload' ? 'upload' : 'claude';
+  const source =
+    body.source === 'upload'
+      ? 'upload'
+      : body.source === 'manual'
+        ? 'manual'
+        : body.source === 'seed'
+          ? 'seed'
+          : 'claude';
   const cases = normalizeVaptCases(body.cases, source);
   if (!cases.length) {
     return NextResponse.json({ error: 'No valid VAPT cases to save' }, { status: 400 });

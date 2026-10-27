@@ -20,7 +20,10 @@ import {
   requireAnthropicApiKey,
 } from '@/server/anthropic';
 import { listVaptCases, normalizeVaptCases, VAPT_CHECK_IDS } from '@/server/vapt-store';
-import type { VaptTestCase } from '@/lib/types';
+import type { VaptCaseIntent, VaptProfile, VaptTestCase } from '@/lib/types';
+import { normalizeVaptProfile, vaptProfileHint } from '@/lib/vapt-profile';
+
+export type VaptGenerateIntentMode = VaptCaseIntent | 'both';
 
 const VAPT_SYSTEM_PROMPT = `You are a VAPT (Vulnerability Assessment / Penetration Testing) scenario author for the Augmont LGD Portal.
 Return ONLY valid JSON (no markdown fences) matching this schema:
@@ -29,9 +32,9 @@ Return ONLY valid JSON (no markdown fences) matching this schema:
   "cases": [
     {
       "id": "vapt-login-main-suite",
-      "name": "Login — main VAPT suite",
+      "name": "Login — main VAPT suite (Pass · Higher)",
       "description": "Main login case; attack types are internal scenarios in checks[]",
-      "tags": ["vapt", "login", "main", "suite"],
+      "tags": ["vapt", "login", "main", "suite", "pass", "higher"],
       "estimatedMinutes": 8,
       "kind": "vapt",
       "group": "login-main",
@@ -44,7 +47,9 @@ Return ONLY valid JSON (no markdown fences) matching this schema:
         "body": "{\"key\":\"country\"}",
         "useApiBase": true,
         "checks": ["brute-force", "ddos-rate-limit", "sql-injection-surface"],
-        "severityGate": "critical" | "high" | "medium" | "low" | "info"
+        "severityGate": "critical" | "high" | "medium" | "low" | "info",
+        "intent": "pass" | "fail",
+        "profile": "basic" | "advanced" | "higher"
       }
     }
   ]
@@ -57,19 +62,29 @@ Portal paths (relative to portal baseUrl unless useApiBase is true):
 - Prefer API probes with useApiBase=true and targetUrl "/location" (POST) unless the user asks for another path
 - Unauth path checks still start MCP on /login; probes may include /buyer, /seller, /admin
 
+PASS vs FAIL cases:
+- intent "pass": verify CLEAN / secure posture. Broader check coverage. Name includes "(Pass)". Tags include "pass". Severity gate usually "high". Expect mostly pass findings when controls are good.
+- intent "fail": designed to SURFACE hygiene gaps. Focus on checks that commonly fail (api-auth-bypass, api-error-hygiene, security-headers, cookie-flags, info-disclosure, injection-surface, cors-preflight). Name includes "(Fail)". Tags include "fail". Severity gate often "medium" so findings trip the gate. Still passive hygiene only — never invent exploits.
+
+PROFILE (probe depth — must set on every case):
+- "basic": baseline catalogue probes only (fewer checks OK, 3–8).
+- "advanced": baseline + runtime AI multi-query. Prefer 5–12 checks. Tag "advanced".
+- "higher": baseline + AI multi + AI fail-level escalation on clean pass. Prefer full catalogue or 10–20 checks. Tag "higher".
+
 Rules:
 - kind must be "vapt".
-- Prefer ONE main case: login entry + many internal scenarios via checks[] (suiteMode "combined", group "login-main").
-- Do NOT create one case per attack — put attacks as checks on the login main suite.
+- Prefer ONE main case per intent unless the user asks for separate suites.
+- For intent mode "both": return TWO cases — one pass + one fail (shared target, different intent/checks/gate).
+- Do NOT create one case per attack — put attacks as checks on the suite.
 - Prefer relative paths.
 - startUrl must be "/login" unless the user explicitly asks otherwise.
 - useApiBase=true only for API endpoints (targetUrl); MCP still opens startUrl (/login).
-- id must start with "vapt-" and be unique kebab-case.
-- Default severityGate to "high" unless the user asks otherwise.
-- Return 1 case by default (max 3 only if the user asks for separate suites).
+- id must start with "vapt-" and be unique kebab-case (include -pass- or -fail- in id when generating pairs).
+- Default severityGate to "high" for pass, "medium" for fail unless the user asks otherwise.
+- Always set vapt.intent and vapt.profile explicitly.
 - Do NOT invent active exploit payloads — probes are passive / hygiene HTTP checks only.
 - Catalogue attack ids for internal scenarios: brute-force, ddos-rate-limit, sql-injection-surface, xss-reflection, csrf-surface, rce-surface, command-injection-surface, directory-traversal, file-upload-surface, api-auth-bypass, privilege-escalation, session-hijacking, mitm-tls, ssrf-surface, xxe-surface, deserialization-surface, api-abuse, malware-upload-surface, phishing-credential-surface, zero-day-posture.
-- Map user intent to which checks to include on the login suite (e.g. headers → security-headers; login cookies → cookie-flags; API auth → api-auth-bypass).
+- Map user intent to which checks to include (e.g. headers → security-headers; login cookies → cookie-flags; API auth → api-auth-bypass).
 `;
 
 export type VaptAiProgressEvent = {
@@ -86,6 +101,50 @@ function progress(
   onProgress?.({ ...event, at: event.at || new Date().toISOString() });
 }
 
+function normalizeIntentMode(raw: unknown): VaptGenerateIntentMode {
+  const s = String(raw || '')
+    .trim()
+    .toLowerCase();
+  if (s === 'fail' || s === 'negative' || s === 'failure') return 'fail';
+  if (s === 'both' || s === 'pass-fail' || s === 'pass_and_fail') return 'both';
+  return 'pass';
+}
+
+function applyModeDefaults(
+  cases: VaptTestCase[],
+  intentMode: VaptGenerateIntentMode,
+  profile: VaptProfile,
+): VaptTestCase[] {
+  return cases.map((c, index) => {
+    let intent: VaptCaseIntent = c.vapt.intent || 'pass';
+    if (intentMode === 'pass') intent = 'pass';
+    else if (intentMode === 'fail') intent = 'fail';
+    else if (intentMode === 'both') {
+      // Prefer model intent; if missing, alternate pass/fail
+      intent = c.vapt.intent || (index === 0 ? 'pass' : 'fail');
+    }
+    const resolvedProfile = normalizeVaptProfile(c.vapt.profile || profile);
+    const tags = Array.from(
+      new Set([...(c.tags || []), 'vapt', intent, resolvedProfile]),
+    );
+    const nameHasIntent =
+      /\bpass\b/i.test(c.name) || /\bfail\b/i.test(c.name);
+    const name = nameHasIntent
+      ? c.name
+      : `${c.name} (${intent === 'pass' ? 'Pass' : 'Fail'} · ${resolvedProfile === 'basic' ? 'Basic' : resolvedProfile === 'advanced' ? 'Advanced' : 'Higher'})`;
+    return {
+      ...c,
+      name,
+      tags,
+      vapt: {
+        ...c.vapt,
+        intent,
+        profile: resolvedProfile,
+      },
+    };
+  });
+}
+
 export async function generateVaptCases(input: {
   prompt: string;
   baseUrl?: string;
@@ -96,6 +155,10 @@ export async function generateVaptCases(input: {
   anthropicApiKey?: string | null;
   fileContent?: string | null;
   visitedPaths?: string[] | null;
+  /** pass | fail | both */
+  intent?: VaptGenerateIntentMode | string | null;
+  /** basic | advanced | higher */
+  profile?: VaptProfile | string | null;
   onProgress?: (event: VaptAiProgressEvent) => void;
 }): Promise<{ cases: VaptTestCase[]; model: string; attempted: string[] }> {
   const provider = resolveAiProvider(input.provider);
@@ -107,6 +170,9 @@ export async function generateVaptCases(input: {
   if (!prompt && !fileContent && !visited.length) {
     throw new Error('prompt, file content, or visited paths are required');
   }
+
+  const intentMode = normalizeIntentMode(input.intent);
+  const profile = normalizeVaptProfile(input.profile);
 
   if (provider === 'claude') {
     requireAnthropicApiKey(input.anthropicApiKey);
@@ -121,9 +187,18 @@ export async function generateVaptCases(input: {
     .slice(0, 40)
     .map(
       (c) =>
-        `- ${c.id}: ${c.name} · ${c.vapt.method || 'GET'} ${c.vapt.targetUrl} · checks=${c.vapt.checks.join(',')}`,
+        `- ${c.id}: ${c.name} · ${c.vapt.method || 'GET'} ${c.vapt.targetUrl} · intent=${c.vapt.intent || 'pass'} · profile=${c.vapt.profile || 'higher'} · checks=${c.vapt.checks.join(',')}`,
     )
     .join('\n');
+
+  const intentInstruction =
+    intentMode === 'both'
+      ? 'Generate BOTH a pass-case AND a fail-case (exactly 2 cases) for the same target surface.'
+      : intentMode === 'fail'
+        ? 'Generate FAIL-case suite(s) only (intent "fail") — oriented to surface hygiene gaps.'
+        : 'Generate PASS-case suite(s) only (intent "pass") — oriented to verify clean secure posture.';
+
+  const profileInstruction = `Set every case vapt.profile to "${profile}" (${vaptProfileHint(profile)}).`;
 
   const userParts = [
     input.baseUrl ? `Portal baseUrl: ${input.baseUrl}` : '',
@@ -131,6 +206,7 @@ export async function generateVaptCases(input: {
     existingSummary
       ? `Existing VAPT scenarios (avoid exact duplicates):\n${existingSummary}`
       : 'No existing VAPT scenarios yet.',
+    `AUTHORING MODE:\n- ${intentInstruction}\n- ${profileInstruction}`,
     visited.length
       ? `MCP-VISITED PATHS (create passive VAPT probe scenarios for these surfaces):\n${visited.map((p) => `- ${p}`).join('\n')}`
       : '',
@@ -148,6 +224,11 @@ export async function generateVaptCases(input: {
   const attempted: string[] = [];
   const errors: string[] = [];
 
+  const finish = (cases: VaptTestCase[], model: string) => {
+    const applied = applyModeDefaults(cases, intentMode, profile);
+    return { cases: applied, model, attempted };
+  };
+
   if (provider === 'claude') {
     const apiKey = requireAnthropicApiKey(input.anthropicApiKey);
     const primary = normalizeClaudeModelId(
@@ -160,7 +241,7 @@ export async function generateVaptCases(input: {
 
     progress(input.onProgress, {
       type: 'status',
-      message: 'Generating VAPT scenarios · Claude',
+      message: `Generating VAPT ${intentMode} · ${profile} · Claude`,
     });
 
     for (let i = 0; i < chain.length; i++) {
@@ -188,7 +269,7 @@ export async function generateVaptCases(input: {
             model,
             message: `Parsed ${cases.length} VAPT case(s) from ${model}`,
           });
-          return { cases, model, attempted };
+          return finish(cases, model);
         } catch (parseErr) {
           const msg = parseErr instanceof Error ? parseErr.message : 'Invalid JSON';
           errors.push(`${modelId}: ${msg}`);
@@ -220,7 +301,7 @@ export async function generateVaptCases(input: {
 
   progress(input.onProgress, {
     type: 'status',
-    message: 'Generating VAPT scenarios · OpenRouter',
+    message: `Generating VAPT ${intentMode} · ${profile} · OpenRouter`,
   });
 
   for (let i = 0; i < chain.length; i++) {
@@ -248,7 +329,7 @@ export async function generateVaptCases(input: {
           model,
           message: `Parsed ${cases.length} VAPT case(s) from ${model}`,
         });
-        return { cases, model, attempted };
+        return finish(cases, model);
       } catch (parseErr) {
         const msg = parseErr instanceof Error ? parseErr.message : 'Invalid JSON';
         errors.push(`${modelId}: ${msg}`);

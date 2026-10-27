@@ -28,6 +28,12 @@ import {
 } from '@/server/report-capture';
 import { resolveVaptStartUrl, resolveVaptTargetUrl } from '@/server/vapt-store';
 import { countAttacks, vaptAttackLabel } from '@/lib/vapt-attacks';
+import {
+  normalizeVaptProfile,
+  vaptProfileHint,
+  vaptProfileUsesAiMulti,
+  vaptProfileUsesFailLevel,
+} from '@/lib/vapt-profile';
 import { runCatalogueAttackProbe } from '@/server/vapt-catalogue-probes';
 import { generateRuntimeProbeQueries } from '@/server/vapt-runtime-ai';
 import {
@@ -1199,11 +1205,14 @@ export function createVaptSessionSteps(test: VaptTestCase): TestStep[] {
   const start = vapt.startUrl || '/login';
   const attacks = vapt.checks;
   const total = countAttacks(attacks);
+  const profile = normalizeVaptProfile(vapt.profile);
+  const intent = vapt.intent === 'fail' ? 'fail' : 'pass';
+  const depthHint = vaptProfileHint(profile);
   return [
     {
       id: 'vapt-prepare',
       label: 'Prepare API VAPT',
-      description: `MCP start ${start} · API ${vapt.method || 'GET'} ${vapt.targetUrl} · ${total} attack(s)`,
+      description: `MCP start ${start} · API ${vapt.method || 'GET'} ${vapt.targetUrl} · ${total} attack(s) · ${intent} · ${profile}`,
       status: 'pending',
       action: 'wait',
     },
@@ -1217,14 +1226,14 @@ export function createVaptSessionSteps(test: VaptTestCase): TestStep[] {
     ...attacks.map((check, index) => ({
       id: `vapt-check-${check}`,
       label: `Scenario ${index + 1}/${total} · ${vaptAttackLabel(check)}`,
-      description: `Baseline → AI multi queries → on pass AI fail-level · ${vapt.method || 'GET'} ${vapt.targetUrl} · id=${check}`,
+      description: `${depthHint} · ${vapt.method || 'GET'} ${vapt.targetUrl} · id=${check}`,
       status: 'pending' as const,
       action: 'assertVisible' as const,
     })),
     {
       id: 'vapt-gate',
       label: 'Severity gate + report',
-      description: `Fail if any finding ≥ ${vapt.severityGate || 'high'} · all steps/rounds/pass-fail → report`,
+      description: `Fail if any finding ≥ ${vapt.severityGate || 'high'} · ${intent}/${profile} · all steps/rounds/pass-fail → report`,
       status: 'pending',
       action: 'assertVisible',
     },
@@ -1237,6 +1246,7 @@ export async function runVapt(
   test: VaptTestCase,
   opts?: {
     apiUrl?: string;
+    /** Override case profile AI depth; false forces baseline-only */
     runtimeAi?: boolean;
     provider?: AiProviderId | string | null;
     openRouterApiKey?: string | null;
@@ -1253,7 +1263,10 @@ export async function runVapt(
   const signal = session.abortController.signal;
   const method = vapt.method || 'GET';
   const gate = vapt.severityGate || 'high';
-  const runtimeAi = opts?.runtimeAi !== false;
+  const profile = normalizeVaptProfile(vapt.profile);
+  const runtimeAiEnabled = opts?.runtimeAi !== false;
+  const useAiMulti = runtimeAiEnabled && vaptProfileUsesAiMulti(profile);
+  const useFailLevel = runtimeAiEnabled && vaptProfileUsesFailLevel(profile);
   let findings: VaptFinding[] = [];
   let networkCaptures: VaptNetworkCapture[] = [];
   let aiProbeRounds: VaptAiProbeRoundSummary[] = [];
@@ -1284,8 +1297,8 @@ export async function runVapt(
     if (signal.aborted) throw new Error('Stopped');
     updateStep(runId, 'vapt-prepare', {
       status: 'passed',
-      message: `Ready · login start · ${vapt.checks.length} attack type(s)`,
-      detail: `MCP ${mcpUrl} · API/probe ${targetUrl}`,
+      message: `Ready · ${vapt.intent || 'pass'} · ${profile} · ${vapt.checks.length} attack type(s)`,
+      detail: `MCP ${mcpUrl} · API/probe ${targetUrl} · ${vaptProfileHint(profile)}`,
     });
 
     updateStep(runId, 'vapt-mcp', {
@@ -1347,8 +1360,8 @@ export async function runVapt(
         ),
       ];
 
-      // —— 2) Runtime AI multi-query ——
-      if (runtimeAi && !signal.aborted) {
+      // —— 2) Runtime AI multi-query (advanced + higher) ——
+      if (useAiMulti && !signal.aborted) {
         updateStep(runId, stepId, {
           status: 'running',
           message: `AI generating multi queries · ${attackLabel}…`,
@@ -1423,8 +1436,8 @@ export async function runVapt(
         }
       }
 
-      // —— 3) On pass → AI fail-level escalation ——
-      if (runtimeAi && !signal.aborted && checkPassedClean(batch, check)) {
+      // —— 3) On pass → AI fail-level escalation (higher only) ——
+      if (useFailLevel && !signal.aborted && checkPassedClean(batch, check)) {
         updateStep(runId, stepId, {
           status: 'running',
           message: `Pass → AI fail-level queries · ${attackLabel}…`,
@@ -1497,7 +1510,7 @@ export async function runVapt(
           });
           stepLog.push(`=== AI FAIL-LEVEL ERROR ===\n${msg}`);
         }
-      } else if (runtimeAi && !checkPassedClean(batch, check)) {
+      } else if (useFailLevel && !checkPassedClean(batch, check)) {
         aiProbeRounds.push({
           checkId: check,
           level: 'fail-level',
@@ -1510,6 +1523,8 @@ export async function runVapt(
           at: new Date().toISOString(),
         });
         stepLog.push('=== AI FAIL-LEVEL SKIPPED (already failed) ===');
+      } else if (!useAiMulti) {
+        stepLog.push(`=== AI ROUNDS SKIPPED (profile=${profile}) ===`);
       }
 
       await paintAttackEvidence(page, {

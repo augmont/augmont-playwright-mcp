@@ -324,11 +324,10 @@ export function WebLoadAiPanel({ baseUrl, apiUrl, onSaved }: Props) {
   const busy = generating || uploading || saving;
 
   const modelSelect = (
-    <label className="field" style={{ margin: 0, minWidth: '10rem' }}>
-      <span className="field-hint" style={{ marginBottom: '0.2rem' }}>
-        Model
-      </span>
+    <label className="ai-model-select-field">
+      <span className="ai-model-select-label">Model</span>
       <select
+        className="ai-model-select"
         value={model}
         onChange={(e) => onModelChange(e.target.value)}
         disabled={busy || !canUseAi}

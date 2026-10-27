@@ -339,6 +339,21 @@ export type VaptCheckCategory =
 
 export type VaptFindingStatus = 'pass' | 'fail' | 'info' | 'error';
 
+/**
+ * Authoring intent for a VAPT suite:
+ * - pass — verify clean/secure posture (expect mostly pass findings)
+ * - fail — surface hygiene gaps / weak controls (designed to catch failures)
+ */
+export type VaptCaseIntent = 'pass' | 'fail';
+
+/**
+ * Probe depth for a VAPT suite:
+ * - basic — catalogue baseline probes only
+ * - advanced — baseline + runtime AI multi-query variants
+ * - higher — baseline + AI multi + AI fail-level escalation on clean pass
+ */
+export type VaptProfile = 'basic' | 'advanced' | 'higher';
+
 export interface VaptConfig {
   /** Absolute URL or path relative to baseUrl / apiUrl (probe target) */
   targetUrl: string;
@@ -356,6 +371,10 @@ export interface VaptConfig {
   checks: VaptCheckId[];
   /** Fail the run if a finding at this severity or higher is fail (default high) */
   severityGate?: VaptSeverity;
+  /** Pass-case vs fail-case authoring intent */
+  intent?: VaptCaseIntent;
+  /** Probe depth: basic / advanced / higher */
+  profile?: VaptProfile;
 }
 
 export interface VaptTestCase extends TestCaseMeta {
@@ -724,8 +743,8 @@ export interface TestCaseMeta {
   isoCode?: string;
   /** Web flow bucket: public | buyer | seller | admin */
   role?: WebFlowRole;
-  /** Where the case came from (web-flow store) */
-  source?: 'seed' | 'claude' | 'upload';
+  /** Where the case came from (web-flow / VAPT store) */
+  source?: 'seed' | 'claude' | 'upload' | 'manual';
   /** Suite / import file grouping (keeps related cases together) */
   group?: string;
   /** Happy path vs failure/invalid path (run branch; combined suites use both) */

@@ -19,6 +19,10 @@ type Body = {
   anthropicApiKey?: string;
   fileContent?: string;
   visitedPaths?: string[];
+  /** pass | fail | both */
+  intent?: string;
+  /** basic | advanced | higher */
+  profile?: string;
 };
 
 export async function GET() {
@@ -47,6 +51,9 @@ export async function POST(request: Request) {
 
   const aiKeys = sanitizeClientAiKeys(body);
 
+  const intent = body.intent || 'pass';
+  const profile = body.profile || 'higher';
+
   if (!body.stream) {
     try {
       const result = await generateVaptCases({
@@ -59,6 +66,8 @@ export async function POST(request: Request) {
         anthropicApiKey: aiKeys.anthropicApiKey,
         fileContent: fileContent || undefined,
         visitedPaths,
+        intent,
+        profile,
       });
       return NextResponse.json({
         ok: true,
@@ -66,7 +75,7 @@ export async function POST(request: Request) {
         model: result.model,
         attempted: result.attempted,
         cases: result.cases,
-        message: `Generated ${result.cases.length} VAPT scenario(s) via ${result.model}. Review and save.`,
+        message: `Generated ${result.cases.length} VAPT scenario(s) (${intent} · ${profile}) via ${result.model}. Review and save.`,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Generate failed';
@@ -81,7 +90,10 @@ export async function POST(request: Request) {
         controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
       };
       try {
-        send({ type: 'status', message: 'Starting VAPT scenario generate…' });
+        send({
+          type: 'status',
+          message: `Starting VAPT generate · ${intent} · ${profile}…`,
+        });
         const result = await generateVaptCases({
           prompt:
             prompt ||
@@ -96,6 +108,8 @@ export async function POST(request: Request) {
           anthropicApiKey: aiKeys.anthropicApiKey,
           fileContent: fileContent || undefined,
           visitedPaths,
+          intent,
+          profile,
           onProgress: (event: VaptAiProgressEvent) => {
             send({ ...event });
           },
@@ -105,7 +119,7 @@ export async function POST(request: Request) {
           model: result.model,
           attempted: result.attempted,
           cases: result.cases,
-          message: `Generated ${result.cases.length} VAPT scenario(s) via ${result.model}. Review and save.`,
+          message: `Generated ${result.cases.length} VAPT scenario(s) (${intent} · ${profile}) via ${result.model}. Review and save.`,
         });
       } catch (err) {
         send({
